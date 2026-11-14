@@ -2679,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "oddity-picview"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "chrono",
  "clipboard-win",
