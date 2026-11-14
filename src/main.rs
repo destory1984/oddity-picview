@@ -2325,35 +2325,113 @@ impl App {
         let enter = ctx.input(|i| i.key_pressed(Key::Enter));
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
         match dialog {
+            // layout and colours from a GPT (Codex) proposal, styled only inside this window
             Dialog::Delete(paths) => {
+                use egui::{Color32 as C, CornerRadius, Frame, RichText, Stroke, vec2};
+                let text = C::from_rgb(36, 48, 60);
+                let muted = C::from_rgb(111, 124, 140);
+                let line = C::from_rgb(230, 234, 240);
+                let danger = C::from_rgb(169, 50, 38);
+                let metadata: Vec<_> = paths.iter().map(std::fs::metadata).collect();
+                let limited = paths.len() > 1000;
+                let limit = if limited { 200 } else { paths.len() };
+                let bytes = metadata.iter().take(limit).filter_map(|m| m.as_ref().ok())
+                    .filter(|m| m.is_file()).fold(0u64, |n, m| n.saturating_add(m.len()));
+                let folders = metadata.iter().any(|m| m.as_ref().is_ok_and(|m| m.is_dir()));
+                let incomplete = metadata.iter().any(|m| m.is_err());
+                let mut summary = if limited {
+                    format!("파일 용량: 약 {} (앞 200개 기준)", fmt_size(bytes))
+                } else {
+                    format!("파일 용량: {}", fmt_size(bytes))
+                };
+                if folders { summary.push_str(" · 폴더 포함"); }
+                if incomplete { summary.push_str(" · 일부 확인 불가"); }
+                let frame = Frame::new().fill(C::WHITE)
+                    .stroke(Stroke::new(1.0f32, C::from_rgb(213, 218, 225)))
+                    .corner_radius(CornerRadius::same(8)).inner_margin(16)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 4], blur: 12, spread: 0, color: C::from_black_alpha(32),
+                    });
                 let mut result: Option<bool> = None;
-                egui::Window::new("삭제")
-                    .collapsible(false)
-                    .resizable(false)
+                egui::Window::new(RichText::new("삭제").size(18.0).color(text))
+                    .collapsible(false).resizable(false)
                     .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-                    .show(ctx, |ui| {
-                        if paths.len() == 1 {
-                            let n = paths[0].file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                            ui.label(format!("'{n}'을(를) 휴지통으로 보낼까요?"));
-                        } else {
-                            ui.label(format!("{}개 항목을 휴지통으로 보낼까요?", paths.len()));
+                    .default_width(440.0).frame(frame).show(ctx, |ui| {
+                        ui.set_width(440.0);
+                        for t in [egui::TextStyle::Body, egui::TextStyle::Button] {
+                            ui.style_mut().text_styles.insert(t, egui::FontId::proportional(13.0));
                         }
+                        ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+                        ui.spacing_mut().button_padding = vec2(10.0, 5.0);
+                        ui.spacing_mut().interact_size.y = 30.0;
+                        let v = ui.visuals_mut();
+                        v.override_text_color = Some(text);
+                        for w in [&mut v.widgets.inactive, &mut v.widgets.hovered,
+                                  &mut v.widgets.active, &mut v.widgets.open] {
+                            w.corner_radius = CornerRadius::same(4);
+                            w.bg_stroke = Stroke::new(1.0f32, line);
+                            w.fg_stroke = Stroke::new(1.0f32, text);
+                            w.expansion = 0.0;
+                        }
+                        v.widgets.inactive.weak_bg_fill = C::WHITE;
+                        v.widgets.hovered.weak_bg_fill = C::from_rgb(229, 241, 255);
+                        v.widgets.active.weak_bg_fill = C::from_rgb(212, 231, 252);
+                        v.widgets.open.weak_bg_fill = C::from_rgb(229, 241, 255);
+                        ui.horizontal_top(|ui| {
+                            ui.image((self.icons.delete.id(), vec2(40.0, 40.0)));
+                            ui.add_space(4.0);
+                            ui.vertical(|ui| {
+                                ui.set_width(388.0);
+                                let prompt = if paths.len() == 1 {
+                                    "이 항목을 휴지통으로 보낼까요?".to_owned()
+                                } else {
+                                    format!("{}개 항목을 휴지통으로 보낼까요?", paths.len())
+                                };
+                                ui.label(RichText::new(prompt).size(15.0).strong());
+                                Frame::new().fill(C::from_rgb(248, 250, 252))
+                                    .stroke(Stroke::new(1.0f32, line))
+                                    .corner_radius(CornerRadius::same(6)).inner_margin(12)
+                                    .show(ui, |ui| {
+                                        ui.set_width(362.0);
+                                        ui.spacing_mut().item_spacing.y = 4.0;
+                                        for (i, p) in paths.iter().take(3).enumerate() {
+                                            let name = p.file_name().unwrap_or(p.as_os_str())
+                                                .to_string_lossy().replace(['\r', '\n'], " ");
+                                            let dir = metadata[i].as_ref().is_ok_and(|m| m.is_dir());
+                                            ui.horizontal(|ui| {
+                                                let width = ui.available_width() - if dir { 48.0 } else { 0.0 };
+                                                // left-aligned, cut with "…" when too long
+                                                ui.allocate_ui(vec2(width, 18.0), |ui| {
+                                                    ui.add(egui::Label::new(name).truncate());
+                                                });
+                                                if dir { ui.label(RichText::new("(폴더)").color(muted)); }
+                                            });
+                                        }
+                                        if paths.len() > 3 {
+                                            ui.label(RichText::new(format!("외 {}개", paths.len() - 3))
+                                                .color(muted));
+                                        }
+                                    });
+                                ui.label(RichText::new(&summary).size(12.0).color(muted));
+                                ui.label(RichText::new("휴지통에서 되살릴 수 있습니다")
+                                    .size(12.0).color(muted));
+                            });
+                        });
                         ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("예 (Enter)").clicked() {
-                                result = Some(true);
-                            }
-                            if ui.button("아니오 (Esc)").clicked() {
-                                result = Some(false);
-                            }
+                        // fixed 30px row: a bare right_to_left layout took the whole window height
+                        ui.allocate_ui_with_layout(vec2(ui.available_width(), 30.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let send = egui::Button::new(RichText::new("휴지통으로 보내기").color(danger))
+                                .shortcut_text(RichText::new("Enter").size(12.0).color(danger))
+                                .fill(C::from_rgb(255, 242, 240))
+                                .stroke(Stroke::new(1.0f32, C::from_rgb(233, 184, 177)));
+                            if ui.add_sized([220.0, 30.0], send).clicked() { result = Some(true); }
+                            let cancel = egui::Button::new("취소")
+                                .shortcut_text(RichText::new("Esc").size(12.0).color(muted));
+                            if ui.add_sized([100.0, 30.0], cancel).clicked() { result = Some(false); }
                         });
                     });
-                if enter {
-                    result = Some(true);
-                }
-                if esc {
-                    result = Some(false);
-                }
+                if enter { result = Some(true); }
+                if esc { result = Some(false); }
                 match result {
                     Some(true) => self.do_delete(paths),
                     Some(false) => {}
