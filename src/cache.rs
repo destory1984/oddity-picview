@@ -11,9 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
-/// Cache is trimmed to TRIM_TO once it grows past MAX_BYTES.
-const MAX_BYTES: u64 = 1024 * 1024 * 1024;
-const TRIM_TO: u64 = 800 * 1024 * 1024;
+/// Default size limit, changeable in the settings window.
+pub const DEFAULT_MAX_MB: u64 = 1024;
 /// Bump when the thumbnail format or size changes, to ignore old entries.
 const VERSION: u64 = 1;
 
@@ -106,8 +105,23 @@ pub fn store(path: &Path, size: u64, modified: SystemTime, img: &RgbaImage) {
     }
 }
 
-/// Delete the oldest entries when the cache is over MAX_BYTES. Run off the UI thread.
-pub fn trim() {
+/// Total size of the cache in bytes.
+pub fn usage() -> u64 {
+    let Some(d) = dir() else { return 0 };
+    std::fs::read_dir(d)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|shard| std::fs::read_dir(shard.path()).into_iter().flatten().flatten())
+        .filter_map(|f| f.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// When the cache is over `max_bytes`, delete the least recently used entries
+/// until it is down to 80% of it. Run off the UI thread.
+pub fn trim(max_bytes: u64) {
+    let trim_to = max_bytes / 10 * 8;
     let Some(d) = dir() else { return };
     let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
     let mut total = 0u64;
@@ -122,12 +136,12 @@ pub fn trim() {
             files.push((md.modified().unwrap_or(SystemTime::UNIX_EPOCH), md.len(), f.path()));
         }
     }
-    if total <= MAX_BYTES {
+    if total <= max_bytes {
         return;
     }
     files.sort_by_key(|f| f.0);
     for (_, len, p) in files {
-        if total <= TRIM_TO {
+        if total <= trim_to {
             break;
         }
         if std::fs::remove_file(&p).is_ok() {

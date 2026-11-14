@@ -18,6 +18,7 @@ pub struct Icons {
     pub more: TextureHandle,
     pub folder: TextureHandle,
     pub star: TextureHandle,
+    pub settings: TextureHandle,
 }
 
 fn load(ctx: &egui::Context, name: &str, png: &[u8]) -> TextureHandle {
@@ -38,7 +39,7 @@ macro_rules! icons {
 
 impl Icons {
     pub fn new(ctx: &egui::Context) -> Self {
-        icons!(ctx, back, forward, up, recent, refresh, view, rotate_left, rotate_right, rename, delete, explorer, more, folder, star)
+        icons!(ctx, back, forward, up, recent, refresh, view, rotate_left, rotate_right, rename, delete, explorer, more, folder, star, settings)
     }
 }
 

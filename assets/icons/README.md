@@ -16,5 +16,6 @@ Copyright (c) 2007-2026 Haiku, Inc. MIT license, see [LICENSE](LICENSE) in this 
 | more.png | Prefs_Menu |
 | folder.png | Folder_generic |
 | star.png | HaikuDepot_StarBlue |
+| settings.png | Overlay_gear |
 | refresh.png | drawn for oddity-picview in the same green-arrow style |
 | rotate_left.png, rotate_right.png | File_Image_1 with an added arrow |

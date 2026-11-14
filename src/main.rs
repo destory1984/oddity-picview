@@ -119,6 +119,8 @@ struct Settings {
     favorites: Vec<PathBuf>,
     /// last 10 folders files were copied / moved into
     transfer_dirs: Vec<PathBuf>,
+    /// thumbnail cache limit; trimmed to 80% of it at start-up
+    cache_max_mb: u64,
 }
 
 impl Default for Settings {
@@ -131,6 +133,7 @@ impl Default for Settings {
             thumb_size: 160.0,
             favorites: Vec::new(),
             transfer_dirs: Vec::new(),
+            cache_max_mb: cache::DEFAULT_MAX_MB,
         }
     }
 }
@@ -218,12 +221,15 @@ struct App {
     transfer_dirs: Vec<PathBuf>,
     /// folder under the pointer while dragging files (set by drop targets each frame)
     dnd_target: Option<PathBuf>,
+    cache_max_mb: u64,
+    show_settings: bool,
+    /// bytes in the thumbnail cache, measured in the background (u64::MAX = not yet)
+    cache_usage: Arc<AtomicU64>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, start: Option<PathBuf>) -> Self {
         setup_fonts(&cc.egui_ctx);
-        std::thread::spawn(cache::trim);
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         let (tx, rx) = mpsc::channel();
 
@@ -233,6 +239,8 @@ impl App {
             .collect();
 
         let saved: Settings = cc.storage.and_then(|st| eframe::get_value(st, eframe::APP_KEY)).unwrap_or_default();
+        let limit = saved.cache_max_mb.clamp(100, 102_400) * 1024 * 1024;
+        std::thread::spawn(move || cache::trim(limit));
         let mut app = App {
             ctx: cc.egui_ctx.clone(),
             cur_dir: PathBuf::new(),
@@ -282,6 +290,9 @@ impl App {
             icons: Arc::new(icons::Icons::new(&cc.egui_ctx)),
             transfer_dirs: saved.transfer_dirs.iter().filter(|p| p.is_dir()).take(TRANSFER_MAX).cloned().collect(),
             dnd_target: None,
+            cache_max_mb: saved.cache_max_mb.clamp(100, 102_400),
+            show_settings: false,
+            cache_usage: Arc::new(AtomicU64::new(u64::MAX)),
             recent: saved.recent.into_iter().filter(|p| p.is_dir()).take(RECENT_MAX).collect(),
         };
 
@@ -1277,7 +1288,7 @@ impl App {
     // ------------------------------------------------------------ UI: browser
 
     fn modal_open(&self) -> bool {
-        self.dialog.is_some()
+        self.dialog.is_some() || self.show_settings
     }
 
     fn grid_keys(&mut self, ctx: &egui::Context) {
@@ -1442,6 +1453,9 @@ impl App {
             }
             egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                 ui.set_min_width(180.0);
+                if ui.button("설정…").clicked() {
+                    self.open_settings();
+                }
                 if ui.button("썸네일 캐시 비우기").clicked() {
                     self.status = match cache::clear() {
                         Ok(()) => "썸네일 캐시를 비웠습니다".into(),
@@ -1454,6 +1468,9 @@ impl App {
                     }
                 }
             });
+            if tool_button(ui, &ic.settings, "설정", true).clicked() {
+                self.open_settings();
+            }
             ui.separator();
 
             // sort and size controls, centred on the button row
@@ -2110,6 +2127,91 @@ impl App {
             });
     }
 
+    // ------------------------------------------------------------ settings
+
+    fn measure_cache(&self) {
+        let (usage, ctx) = (self.cache_usage.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            usage.store(cache::usage(), Ordering::Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
+    fn open_settings(&mut self) {
+        self.show_settings = true;
+        self.cache_usage.store(u64::MAX, Ordering::Relaxed);
+        self.measure_cache();
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("설정")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(egui::RichText::new("썸네일 캐시").strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("최대 크기");
+                    ui.add(
+                        egui::DragValue::new(&mut self.cache_max_mb)
+                            .range(100..=102_400)
+                            .speed(10)
+                            .suffix(" MB"),
+                    );
+                    for (label, mb) in [("500MB", 500), ("1GB", 1024), ("5GB", 5120)] {
+                        if ui.small_button(label).clicked() {
+                            self.cache_max_mb = mb;
+                        }
+                    }
+                });
+                ui.weak(format!(
+                    "{} 를 넘으면 프로그램을 켤 때 오래 안 본 썸네일부터 지워 {} 로 줄입니다.",
+                    fmt_size(self.cache_max_mb * 1024 * 1024),
+                    fmt_size(self.cache_max_mb * 1024 * 1024 / 10 * 8),
+                ));
+                let used = self.cache_usage.load(Ordering::Relaxed);
+                ui.label(if used == u64::MAX { "지금 쓰는 양: 재는 중…".to_string() } else { format!("지금 쓰는 양: {}", fmt_size(used)) });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("지금 줄이기").on_hover_text("최대 크기를 넘었으면 지금 바로 줄입니다").clicked() {
+                        let (limit, usage, c) = (self.cache_max_mb * 1024 * 1024, self.cache_usage.clone(), self.ctx.clone());
+                        usage.store(u64::MAX, Ordering::Relaxed);
+                        std::thread::spawn(move || {
+                            cache::trim(limit);
+                            usage.store(cache::usage(), Ordering::Relaxed);
+                            c.request_repaint();
+                        });
+                    }
+                    if ui.button("모두 비우기").clicked() {
+                        self.status = match cache::clear() {
+                            Ok(()) => "썸네일 캐시를 비웠습니다".into(),
+                            Err(e) => format!("캐시 비우기 실패: {e}"),
+                        };
+                        self.cache_usage.store(u64::MAX, Ordering::Relaxed);
+                        self.measure_cache();
+                    }
+                    if ui.button("폴더 열기").clicked() {
+                        if let Some(d) = cache::dir() {
+                            let _ = std::process::Command::new("explorer").arg(d).spawn();
+                        }
+                    }
+                });
+                if let Some(d) = cache::dir() {
+                    ui.weak(d.display().to_string());
+                }
+            });
+        if !open {
+            self.show_settings = false;
+        }
+    }
+
     // ------------------------------------------------------------ dialogs
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -2231,6 +2333,7 @@ impl eframe::App for App {
             thumb_size: self.thumb_size,
             favorites: self.favorites.clone(),
             transfer_dirs: self.transfer_dirs.clone(),
+            cache_max_mb: self.cache_max_mb,
         };
         eframe::set_value(storage, eframe::APP_KEY, &s);
     }
@@ -2249,6 +2352,7 @@ impl eframe::App for App {
             self.browser_ui(ctx);
         }
         self.dialogs(ctx);
+        self.settings_window(ctx);
         self.drag_overlay(ctx);
         self.run_actions();
         self.evict_thumbs();
@@ -2437,7 +2541,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([640.0, 400.0])
-            .with_title("Oddity PicView"),
+            .with_title(format!("Oddity PicView {}", env!("CARGO_PKG_VERSION"))),
         // PICVIEW_DATA_DIR keeps benchmark runs away from the user's settings
         persistence_path: std::env::var_os("PICVIEW_DATA_DIR").map(|d| PathBuf::from(d).join("app.ron")),
         ..Default::default()
