@@ -86,6 +86,7 @@ enum Action {
     Rotate(Vec<PathBuf>, i32),
     ShowInExplorer(PathBuf),
     Go(PathBuf),
+    Up,
     /// copy (false) or move (true) files into a folder
     Transfer(Vec<PathBuf>, PathBuf, bool),
     /// ask for a folder with the system dialog, then copy / move there
@@ -351,7 +352,10 @@ impl App {
                 old.insert(e.path.clone(), tex);
             }
         }
+        // remember the focused file by path: the index means nothing in the new list
         let old_focus = self.focus;
+        let old_focus_path = old_focus.and_then(|i| self.entries.get(i)).map(|e| e.path.clone());
+        self.focus = None;
         self.entries = entries;
         self.thumbs = self
             .entries
@@ -363,11 +367,20 @@ impl App {
         self.sort_entries();
         self.selected.clear();
         let n = self.entries.len();
+        let explicit = focus_path.is_some();
         let target = focus_path
             .and_then(|p| self.index_of(&p))
+            .or_else(|| old_focus_path.and_then(|p| self.index_of(&p)))
             .or_else(|| old_focus.filter(|_| n > 0).map(|f| f.min(n - 1)));
         match target {
-            Some(i) => self.select_single(i),
+            // a file we were asked to show (rename, new folder): scroll to it
+            Some(i) if explicit => self.select_single(i),
+            // after a move / paste / refresh: keep the view where it is
+            Some(i) => {
+                self.selected.insert(i);
+                self.anchor = Some(i);
+                self.set_focus(i);
+            }
             None => {
                 self.focus = None;
                 self.anchor = None;
@@ -522,10 +535,15 @@ impl App {
         vec2(self.thumb_size + 16.0, self.thumb_size + 16.0 + 22.0)
     }
 
+    /// 1 when the grid starts with the ".." (parent folder) cell.
+    fn slot_off(&self) -> usize {
+        self.cur_dir.parent().is_some() as usize
+    }
+
     fn ensure_visible(&mut self, i: usize) {
         let cell = self.cell_size();
         let pitch = cell.y + GAP;
-        let top = (i / self.cols.max(1)) as f32 * pitch;
+        let top = ((i + self.slot_off()) / self.cols.max(1)) as f32 * pitch;
         if top < self.grid_offset {
             self.grid_scroll_to = Some(top);
         } else if top + cell.y > self.grid_offset + self.grid_view_h {
@@ -954,6 +972,7 @@ impl App {
         match a {
             Action::Open(i) => self.open_entry(i),
             Action::Go(p) => self.navigate(p, true),
+            Action::Up => self.go_up(),
             Action::NewFolder(parent) => self.ask_new_folder(parent),
             Action::AddFavorite(p) => {
                 if !self.favorites.contains(&p) {
@@ -1569,15 +1588,17 @@ impl App {
         let dir = self.cur_dir.clone();
         bg.context_menu(|ui| self.file_menu(ui, Vec::new(), dir.clone()));
         let n = self.entries.len();
-        if n == 0 {
+        let off = self.slot_off();
+        if n + off == 0 {
             ui.centered_and_justified(|ui| ui.weak("그림이 없습니다"));
             return;
         }
+        let slots = n + off;
         let cell = self.cell_size();
         let avail = ui.available_width();
         let cols = (((avail + GAP) / (cell.x + GAP)).floor() as usize).max(1);
         self.cols = cols;
-        let rows = n.div_ceil(cols);
+        let rows = slots.div_ceil(cols);
         ui.spacing_mut().item_spacing.y = GAP;
         if self.grid_scroll_to.is_some() {
             self.scroll_anim = None; // keyboard / navigation jumps win over the animation
@@ -1599,23 +1620,28 @@ impl App {
             sa = sa.vertical_scroll_offset(off);
         }
         let out = sa.show_rows(ui, cell.y, rows, |ui, range| {
-            let s = range.start * cols;
-            let e = (range.end * cols).min(n);
+            // grid slots -> entry indices (slot 0 may be "..")
+            let s = (range.start * cols).saturating_sub(off);
+            let e = (range.end * cols).saturating_sub(off).min(n);
             self.vis_start.store(s, Ordering::Relaxed);
             self.vis_end.store(e, Ordering::Relaxed);
             for r in range.clone() {
                 let (row_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), cell.y), Sense::hover());
                 for c in 0..cols {
-                    let i = r * cols + c;
-                    if i >= n {
+                    let slot = r * cols + c;
+                    if slot >= slots {
                         break;
                     }
                     let rect = Rect::from_min_size(row_rect.min + vec2(c as f32 * (cell.x + GAP), 0.0), cell);
-                    self.cell(ui, i, rect);
+                    if slot < off {
+                        self.up_cell(ui, rect);
+                    } else {
+                        self.cell(ui, slot - off, rect);
+                    }
                 }
             }
             // visible first, then two rows ahead
-            for i in s..((range.end + 2) * cols).min(n) {
+            for i in s..((range.end + 2) * cols).saturating_sub(off).min(n) {
                 self.request_thumb(i);
             }
         });
@@ -1667,6 +1693,35 @@ impl App {
         let to = (row * pitch).clamp(0.0, max);
         self.grid_scroll_to = None;
         self.scroll_anim = Some((self.grid_offset, to, Instant::now()));
+    }
+
+    /// The ".." cell: double-click goes up, files dropped on it move to the parent.
+    fn up_cell(&mut self, ui: &mut Ui, rect: Rect) {
+        let Some(parent) = self.cur_dir.parent().map(Path::to_path_buf) else { return };
+        let resp = ui.interact(rect, Id::new("cell_up"), Sense::click());
+        let painter = ui.painter();
+        let bg = if resp.hovered() { Color32::from_rgb(235, 244, 255) } else { Color32::WHITE };
+        painter.rect_filled(rect, 4.0f32, bg);
+        painter.rect_stroke(rect, 4.0f32, Stroke::new(1.0f32, Color32::from_gray(215)), egui::StrokeKind::Inside);
+        let ts = self.thumb_size;
+        let img_area = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(ts, ts));
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        let fr = Rect::from_center_size(img_area.center(), img_area.size() * 0.60);
+        painter.image(self.icons.folder.id(), fr, uv, Color32::WHITE);
+        let ar = Rect::from_center_size(fr.right_bottom() - fr.size() * 0.18, fr.size() * 0.5);
+        painter.image(self.icons.up.id(), ar, uv, Color32::WHITE);
+        painter.text(
+            pos2(rect.center().x, rect.max.y - 11.0),
+            Align2::CENTER_CENTER,
+            "..  (상위 폴더)",
+            FontId::proportional(13.0),
+            Color32::from_gray(30),
+        );
+        let resp = resp.on_hover_text(parent.display().to_string());
+        if resp.double_clicked() {
+            self.actions.push(Action::Up);
+        }
+        self.drop_target(ui, &resp, &parent);
     }
 
     fn cell(&mut self, ui: &mut Ui, i: usize, rect: Rect) {
