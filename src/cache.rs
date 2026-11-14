@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 /// Default size limit, changeable in the settings window.
-pub const DEFAULT_MAX_MB: u64 = 1024;
+pub const DEFAULT_MAX_MB: u64 = 100;
 /// Bump when the thumbnail format or size changes, to ignore old entries.
 const VERSION: u64 = 1;
 
