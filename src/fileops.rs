@@ -1,0 +1,209 @@
+//! Windows shell glue: file clipboard (shared with Explorer), copy/move with
+//! the native progress dialog, and the Properties dialog.
+
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+
+const DROPEFFECT_MOVE: u32 = 2;
+
+fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+    s.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Double-NUL-terminated list, as SHFileOperation wants.
+fn wide_list(paths: &[PathBuf]) -> Vec<u16> {
+    let mut v = Vec::new();
+    for p in paths {
+        v.extend(p.as_os_str().encode_wide());
+        v.push(0);
+    }
+    v.push(0);
+    v
+}
+
+fn drop_effect_format() -> Option<u32> {
+    clipboard_win::register_format("Preferred DropEffect").map(|f| f.get())
+}
+
+/// Put files on the clipboard the way Explorer does, so pasting works there too.
+pub fn clipboard_set_files(paths: &[PathBuf], cut: bool) -> Result<(), String> {
+    let _clip = clipboard_win::Clipboard::new_attempts(10).map_err(|e| e.to_string())?;
+    clipboard_win::raw::empty().map_err(|e| e.to_string())?;
+    let list: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    clipboard_win::raw::set_file_list(&list).map_err(|e| e.to_string())?;
+    if let Some(fmt) = drop_effect_format() {
+        let effect: u32 = if cut { DROPEFFECT_MOVE } else { 1 };
+        clipboard_win::raw::set_without_clear(fmt, &effect.to_le_bytes()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Files on the clipboard and whether they were cut (move) rather than copied.
+pub fn clipboard_get_files() -> Option<(Vec<PathBuf>, bool)> {
+    let _clip = clipboard_win::Clipboard::new_attempts(10).ok()?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    clipboard_win::raw::get_file_list_path(&mut files).ok()?;
+    if files.is_empty() {
+        return None;
+    }
+    let cut = drop_effect_format()
+        .and_then(|f| {
+            let mut v = Vec::new();
+            clipboard_win::raw::get_vec(f, &mut v).ok()?;
+            Some(v.len() >= 4 && u32::from_le_bytes([v[0], v[1], v[2], v[3]]) & DROPEFFECT_MOVE != 0)
+        })
+        .unwrap_or(false);
+    Some((files, cut))
+}
+
+pub fn clipboard_has_files() -> bool {
+    clipboard_win::raw::is_format_avail(15) // CF_HDROP
+}
+
+pub fn clipboard_clear() {
+    if let Ok(_clip) = clipboard_win::Clipboard::new_attempts(10) {
+        let _ = clipboard_win::raw::empty();
+    }
+}
+
+/// Copy or move with Explorer's own progress / overwrite dialogs. Blocks; run on a worker thread.
+/// Returns Ok(false) if the user cancelled part of it.
+pub fn shell_copy_move(srcs: &[PathBuf], dest_dir: &Path, mv: bool) -> Result<bool, String> {
+    use windows_sys::Win32::UI::Shell::{
+        SHFileOperationW, FOF_ALLOWUNDO, FOF_RENAMEONCOLLISION, FO_COPY, FO_MOVE, SHFILEOPSTRUCTW,
+    };
+    // pasting a copy into its own folder makes "name - 복사본" like Explorer
+    let same_dir = srcs.iter().any(|s| s.parent() == Some(dest_dir));
+    let from = wide_list(srcs);
+    let to = wide_list(&[dest_dir.to_path_buf()]);
+    let mut flags = FOF_ALLOWUNDO as u16;
+    if same_dir && !mv {
+        flags |= FOF_RENAMEONCOLLISION as u16;
+    }
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: std::ptr::null_mut(),
+        wFunc: if mv { FO_MOVE } else { FO_COPY },
+        pFrom: from.as_ptr(),
+        pTo: to.as_ptr(),
+        fFlags: flags,
+        fAnyOperationsAborted: 0,
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: std::ptr::null(),
+    };
+    let r = unsafe { SHFileOperationW(&mut op) };
+    if r != 0 {
+        return Err(format!("오류 코드 0x{r:X}"));
+    }
+    Ok(op.fAnyOperationsAborted == 0)
+}
+
+/// Open Explorer's Properties dialog for a file or folder.
+pub fn show_properties(path: &Path) {
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
+    let verb = wide(std::ffi::OsStr::new("properties"));
+    let file = wide(path.as_os_str());
+    unsafe {
+        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_INVOKEIDLIST;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        info.nShow = SW_SHOW;
+        ShellExecuteExW(&mut info);
+    }
+}
+
+/// egui only reports Ctrl+V when the clipboard holds text, so read the key state directly.
+pub fn ctrl_v_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+    unsafe { GetKeyState(VK_CONTROL as i32) < 0 && GetKeyState(b'V' as i32) < 0 }
+}
+
+/// Open with the program Windows associates with the file (video player, music player...).
+pub fn open_default(path: &Path) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let verb = wide(std::ffi::OsStr::new("open"));
+    let file = wide(path.as_os_str());
+    unsafe {
+        ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+    }
+}
+
+/// Thumbnail from the Windows shell, the same one Explorer shows: a frame for
+/// videos, album art (or the file type icon) for audio. Safe to call from any thread.
+pub fn shell_thumbnail(path: &Path, size: i32) -> Result<image::RgbaImage, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
+        BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    };
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_RESIZETOFIT};
+
+    let wpath = wide(path.as_os_str());
+    unsafe {
+        // worker threads: join the multithreaded COM apartment (no-op if already in)
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let factory: IShellItemImageFactory =
+            SHCreateItemFromParsingName(PCWSTR(wpath.as_ptr()), None).map_err(|e| e.to_string())?;
+        let hbmp = factory.GetImage(SIZE { cx: size, cy: size }, SIIGBF_RESIZETOFIT).map_err(|e| e.to_string())?;
+        let obj = HGDIOBJ(hbmp.0);
+        let mut bm = BITMAP::default();
+        if GetObjectW(obj, std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut _)) == 0 {
+            let _ = DeleteObject(obj);
+            return Err("GetObject failed".into());
+        }
+        let (w, h) = (bm.bmWidth.max(1) as u32, bm.bmHeight.unsigned_abs().max(1));
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32), // top-down rows
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let dc = CreateCompatibleDC(None);
+        let lines = GetDIBits(dc, hbmp, 0, h, Some(px.as_mut_ptr() as *mut _), &mut info, DIB_RGB_COLORS);
+        let _ = DeleteDC(dc);
+        let _ = DeleteObject(obj);
+        if lines == 0 {
+            return Err("GetDIBits failed".into());
+        }
+        let has_alpha = px.chunks_exact(4).any(|c| c[3] != 0);
+        for c in px.chunks_exact_mut(4) {
+            c.swap(0, 2); // BGRA -> RGBA
+            if !has_alpha {
+                c[3] = 255; // plain RGB bitmap
+            } else if c[3] > 0 && c[3] < 255 {
+                // shell bitmaps are premultiplied
+                for k in 0..3 {
+                    c[k] = ((c[k] as u32 * 255) / c[3] as u32).min(255) as u8;
+                }
+            }
+        }
+        image::RgbaImage::from_raw(w, h, px).ok_or_else(|| "bad bitmap".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// PICVIEW_MEDIA=<file> PICVIEW_OUT=<png> cargo test --release shell_thumb -- --ignored
+    #[test]
+    #[ignore]
+    fn shell_thumb() {
+        let p = std::env::var("PICVIEW_MEDIA").expect("set PICVIEW_MEDIA");
+        let img = super::shell_thumbnail(std::path::Path::new(&p), 256).expect("thumbnail");
+        println!("{}x{}", img.width(), img.height());
+        if let Ok(out) = std::env::var("PICVIEW_OUT") {
+            img.save(out).unwrap();
+        }
+    }
+}

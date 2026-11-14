@@ -10,6 +10,34 @@ pub const IMG_EXTS: &[&str] = &[
     "jpg", "jpeg", "jfif", "jpe", "png", "gif", "bmp", "webp", "tif", "tiff", "ico",
 ];
 
+pub const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mkv", "avi", "mov", "wmv", "webm", "m4v", "flv", "mpg", "mpeg", "ts", "m2ts", "3gp",
+];
+pub const AUDIO_EXTS: &[&str] = &["mp3", "wav", "flac", "m4a", "aac", "ogg", "wma", "opus"];
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Media {
+    Video,
+    Audio,
+}
+
+fn ext_in(path: &Path, list: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| list.iter().any(|x| e.eq_ignore_ascii_case(x)))
+        .unwrap_or(false)
+}
+
+pub fn media_kind(path: &Path) -> Option<Media> {
+    if ext_in(path, VIDEO_EXTS) {
+        Some(Media::Video)
+    } else if ext_in(path, AUDIO_EXTS) {
+        Some(Media::Audio)
+    } else {
+        None
+    }
+}
+
 pub fn is_image(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -17,13 +45,17 @@ pub fn is_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn exif_orientation(bytes: &[u8]) -> Option<image::metadata::Orientation> {
+/// Raw EXIF Orientation value (1..=8), if the file has one.
+pub fn exif_orientation_value(bytes: &[u8]) -> Option<u8> {
     let exif = exif::Reader::new()
         .read_from_container(&mut Cursor::new(bytes))
         .ok()?;
     let field = exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?;
-    let v = field.value.get_uint(0)?;
-    image::metadata::Orientation::from_exif(v as u8)
+    field.value.get_uint(0).map(|v| v as u8)
+}
+
+fn exif_orientation(bytes: &[u8]) -> Option<image::metadata::Orientation> {
+    image::metadata::Orientation::from_exif(exif_orientation_value(bytes)?)
 }
 
 fn is_jpeg(bytes: &[u8]) -> bool {

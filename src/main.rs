@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod cache;
+mod fileops;
 mod loader;
+mod rotate;
 
 use eframe::egui::{
     self, collapsing_header::CollapsingState, load::SizedTexture, pos2, text::LayoutJob, vec2,
@@ -9,7 +11,7 @@ use eframe::egui::{
     TextFormat, TextureHandle, TextureOptions, Ui, Vec2,
 };
 use std::cmp::Ordering as CmpOrd;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -27,8 +29,16 @@ struct Entry {
     path: PathBuf,
     name: String,
     is_dir: bool,
+    /// video / audio: shell thumbnail, opened in the default program
+    media: Option<loader::Media>,
     size: u64,
     modified: SystemTime,
+}
+
+impl Entry {
+    fn is_img(&self) -> bool {
+        !self.is_dir && self.media.is_none()
+    }
 }
 
 enum Thumb {
@@ -45,10 +55,31 @@ enum Big {
 }
 
 enum Msg {
-    Thumb { gen: u64, idx: usize, tex: TextureHandle },
+    Thumb { gen: u64, idx: usize, mtime: SystemTime, tex: TextureHandle },
     ThumbFail { gen: u64, idx: usize },
     Skip { gen: u64, idx: usize },
-    Big { path: PathBuf, res: Result<(TextureHandle, [u32; 2]), String> },
+    Big { path: PathBuf, mtime: Option<SystemTime>, res: Result<(TextureHandle, [u32; 2]), String> },
+    Rotated { path: PathBuf, turns: i32, res: Result<(), String> },
+    OpDone { status: String, dirs: Vec<PathBuf>, clear_clipboard: bool },
+}
+
+/// Commands from menus and shortcuts. Queued and run after the frame is drawn,
+/// because most of them change `entries` or the folder tree.
+enum Action {
+    Open(usize),
+    NewFolder(PathBuf),
+    AddFavorite(PathBuf),
+    RemoveFavorite(PathBuf),
+    Cut(Vec<PathBuf>),
+    Copy(Vec<PathBuf>),
+    Paste(PathBuf),
+    Delete(Vec<PathBuf>),
+    Rename(PathBuf),
+    Properties(PathBuf),
+    Refresh(PathBuf),
+    Rotate(Vec<PathBuf>, i32),
+    ShowInExplorer(PathBuf),
+    Go(PathBuf),
 }
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -69,11 +100,19 @@ struct Settings {
     sort: SortKey,
     sort_desc: bool,
     thumb_size: f32,
+    favorites: Vec<PathBuf>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { last_dir: None, recent: Vec::new(), sort: SortKey::Name, sort_desc: false, thumb_size: 160.0 }
+        Settings {
+            last_dir: None,
+            recent: Vec::new(),
+            sort: SortKey::Name,
+            sort_desc: false,
+            thumb_size: 160.0,
+            favorites: Vec::new(),
+        }
     }
 }
 
@@ -86,6 +125,7 @@ struct Viewer {
 enum Dialog {
     Delete(Vec<PathBuf>),
     Rename { path: PathBuf, text: String, first: bool },
+    NewFolder { parent: PathBuf, text: String, first: bool },
 }
 
 // ---------------------------------------------------------------- app
@@ -138,6 +178,15 @@ struct App {
     tree_scroll_pending: bool,
     pending_open: Option<usize>,
     recent: Vec<PathBuf>,
+    favorites: Vec<PathBuf>,
+    actions: Vec<Action>,
+    /// files cut to the clipboard by us, drawn faded until pasted
+    cut_paths: HashSet<PathBuf>,
+    ctrl_v_prev: bool,
+    /// rotation (quarter turns) being written to each file right now
+    rot_saving: HashMap<PathBuf, i32>,
+    /// rotation already written to the file but not to this loaded texture
+    baked: HashMap<egui::TextureId, i32>,
 }
 
 impl App {
@@ -192,6 +241,12 @@ impl App {
             tree_children: HashMap::new(),
             tree_scroll_pending: false,
             pending_open: None,
+            favorites: saved.favorites.clone(),
+            actions: Vec::new(),
+            cut_paths: HashSet::new(),
+            ctrl_v_prev: false,
+            rot_saving: HashMap::new(),
+            baked: HashMap::new(),
             recent: saved.recent.into_iter().filter(|p| p.is_dir()).take(RECENT_MAX).collect(),
         };
 
@@ -331,6 +386,8 @@ impl App {
         if e.is_dir {
             let p = e.path.clone();
             self.navigate(p, true);
+        } else if e.media.is_some() {
+            fileops::open_default(&e.path);
         } else {
             self.viewer = Some(Viewer { idx: i, zoom: None, pan: Vec2::ZERO });
         }
@@ -378,7 +435,7 @@ impl App {
             self.focus_dims = self
                 .entries
                 .get(i)
-                .filter(|e| !e.is_dir)
+                .filter(|e| e.is_img())
                 .and_then(|e| image::image_dimensions(&e.path).ok())
                 .map(|(w, h)| [w, h]);
         }
@@ -446,15 +503,84 @@ impl App {
         self.rot.get(p).copied().unwrap_or(0)
     }
 
+    /// Rotation to draw `tex` of file `p` with: turns not yet in the file,
+    /// plus turns already in the file but not in this texture.
+    fn disp_rot(&self, p: &Path, tex: &TextureHandle) -> i32 {
+        self.rot_of(p) + self.baked.get(&tex.id()).copied().unwrap_or(0)
+    }
+
     fn rotate_current(&mut self, d: i32) {
         let targets = match &self.viewer {
             Some(v) => self.entries.get(v.idx).map(|e| vec![e.path.clone()]).unwrap_or_default(),
             None => self.selected_paths(),
         };
-        for p in targets {
-            let r = self.rot.entry(p).or_insert(0);
+        self.rotate_paths(targets, d);
+    }
+
+    /// Show the turn at once, then write it to the file in the background.
+    fn rotate_paths(&mut self, paths: Vec<PathBuf>, d: i32) {
+        for p in paths {
+            if !loader::is_image(&p) {
+                continue;
+            }
+            let r = self.rot.entry(p.clone()).or_insert(0);
             *r = (*r + d).rem_euclid(4);
+            self.save_rotation(&p);
         }
+    }
+
+    fn save_rotation(&mut self, p: &Path) {
+        let turns = self.rot_of(p);
+        if turns == 0 || self.rot_saving.contains_key(p) {
+            return; // nothing to do, or a save is running and will pick up the rest
+        }
+        self.rot_saving.insert(p.to_path_buf(), turns);
+        let (path, tx, ctx) = (p.to_path_buf(), self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let res = rotate::save_rotation(&path, turns);
+            let _ = tx.send(Msg::Rotated { path, turns, res });
+            ctx.request_repaint();
+        });
+    }
+
+    fn on_rotated(&mut self, path: PathBuf, turns: i32, res: Result<(), String>) {
+        self.rot_saving.remove(&path);
+        if let Err(e) = res {
+            self.status = format!("회전 저장 실패: {e}");
+            return;
+        }
+        // the file now holds `turns`; textures already loaded do not
+        let left = (self.rot_of(&path) - turns).rem_euclid(4);
+        if left == 0 {
+            self.rot.remove(&path);
+        } else {
+            self.rot.insert(path.clone(), left);
+        }
+        let mut texs: Vec<egui::TextureId> = Vec::new();
+        if let Some(Big::Ready(t, _)) = self.big.get(&path) {
+            texs.push(t.id());
+        }
+        if matches!(self.big.get(&path), Some(Big::Pending)) {
+            self.big.remove(&path); // still decoding the old file; load again
+        }
+        if let Some(i) = self.index_of(&path) {
+            if let Thumb::Ready(t) = &self.thumbs[i] {
+                texs.push(t.id());
+            }
+            if matches!(self.thumbs[i], Thumb::Pending) {
+                self.thumbs[i] = Thumb::None;
+            }
+            // new mtime = new thumbnail cache key
+            if let Ok(md) = std::fs::metadata(&path) {
+                self.entries[i].size = md.len();
+                self.entries[i].modified = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            }
+        }
+        for id in texs {
+            *self.baked.entry(id).or_insert(0) += turns;
+        }
+        self.status = "회전을 파일에 저장했습니다".into();
+        self.save_rotation(&path); // more turns pressed while saving
     }
 
     // ------------------------------------------------------------ loading
@@ -465,7 +591,7 @@ impl App {
             return;
         }
         self.thumbs[i] = Thumb::Pending;
-        let (path, size, modified) = (e.path.clone(), e.size, e.modified);
+        let (path, size, modified, media) = (e.path.clone(), e.size, e.modified, e.media.is_some());
         let gen = self.gen.load(Ordering::SeqCst);
         let (gen_now, vs, ve) = (self.gen.clone(), self.vis_start.clone(), self.vis_end.clone());
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
@@ -482,13 +608,20 @@ impl App {
             }
             let made = match cache::load(&path, size, modified) {
                 Some(img) => Ok(img),
-                None => loader::make_thumb(&path).inspect(|img| cache::store(&path, size, modified, img)),
+                None => {
+                    let made = if media {
+                        fileops::shell_thumbnail(&path, loader::THUMB_MAX as i32)
+                    } else {
+                        loader::make_thumb(&path)
+                    };
+                    made.inspect(|img| cache::store(&path, size, modified, img))
+                }
             };
             let msg = match made {
                 Ok(img) => {
                     let ci = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
                     let tex = ctx.load_texture(format!("t{gen}/{i}"), ci, tex_opts());
-                    Msg::Thumb { gen, idx: i, tex }
+                    Msg::Thumb { gen, idx: i, mtime: modified, tex }
                 }
                 Err(_) => Msg::ThumbFail { gen, idx: i },
             };
@@ -512,6 +645,7 @@ impl App {
                 self.big.remove(&old);
             }
         }
+        let mtime = self.index_of(path).map(|i| self.entries[i].modified);
         let path = path.to_path_buf();
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let max_side = ctx.input(|i| i.max_texture_side).min(16384) as u32;
@@ -520,7 +654,7 @@ impl App {
                 let ci = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
                 (ctx.load_texture(path.display().to_string(), ci, tex_opts()), dims)
             });
-            let _ = tx.send(Msg::Big { path, res });
+            let _ = tx.send(Msg::Big { path, mtime, res });
             ctx.request_repaint();
         });
     }
@@ -530,9 +664,13 @@ impl App {
         let n = self.thumbs.len();
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                Msg::Thumb { gen: g, idx, tex } if g == gen && idx < n => {
-                    self.thumbs[idx] = Thumb::Ready(tex);
-                    self.thumbs_loaded += 1;
+                Msg::Thumb { gen: g, idx, mtime, tex } if g == gen && idx < n => {
+                    if self.entries[idx].modified == mtime {
+                        self.thumbs[idx] = Thumb::Ready(tex);
+                        self.thumbs_loaded += 1;
+                    } else {
+                        self.thumbs[idx] = Thumb::None; // file changed while decoding
+                    }
                 }
                 Msg::ThumbFail { gen: g, idx } if g == gen && idx < n => self.thumbs[idx] = Thumb::Failed,
                 Msg::Skip { gen: g, idx } if g == gen && idx < n => {
@@ -540,7 +678,23 @@ impl App {
                         self.thumbs[idx] = Thumb::None;
                     }
                 }
-                Msg::Big { path, res } => {
+                Msg::Rotated { path, turns, res } => self.on_rotated(path, turns, res),
+                Msg::OpDone { status, dirs, clear_clipboard } => {
+                    self.status = status;
+                    if clear_clipboard {
+                        fileops::clipboard_clear();
+                        self.cut_paths.clear();
+                    }
+                    for d in dirs {
+                        self.refresh_dir(&d);
+                    }
+                }
+                Msg::Big { path, mtime, res } => {
+                    let now = self.index_of(&path).map(|i| self.entries[i].modified);
+                    if mtime != now {
+                        self.big.remove(&path); // file changed while decoding
+                        continue;
+                    }
                     if let Some(b) = self.big.get_mut(&path) {
                         *b = match res {
                             Ok((t, d)) => Big::Ready(t, d),
@@ -570,7 +724,8 @@ impl App {
     // ------------------------------------------------------------ file ops
 
     fn ask_delete(&mut self, paths: Vec<PathBuf>) {
-        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_file()).collect();
+        // drive roots cannot go to the recycle bin
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| p.exists() && p.parent().is_some()).collect();
         if !paths.is_empty() {
             self.dialog = Some(Dialog::Delete(paths));
         }
@@ -578,11 +733,23 @@ impl App {
 
     fn do_delete(&mut self, paths: Vec<PathBuf>) {
         match trash::delete_all(&paths) {
-            Ok(()) => self.status = format!("{}개 파일을 휴지통으로 보냈습니다", paths.len()),
+            Ok(()) => self.status = format!("{}개 항목을 휴지통으로 보냈습니다", paths.len()),
             Err(e) => self.status = format!("삭제 실패: {e}"),
         }
         for p in &paths {
             self.big.remove(p);
+            self.cut_paths.remove(p);
+            if let Some(parent) = p.parent() {
+                self.tree_children.remove(parent);
+            }
+            self.tree_children.retain(|k, _| !k.starts_with(p));
+        }
+        // the folder being shown (or one above it) was deleted
+        if let Some(gone) = paths.iter().find(|p| self.cur_dir.starts_with(p)).cloned() {
+            if let Some(parent) = gone.parent() {
+                self.navigate(parent.to_path_buf(), false);
+            }
+            return;
         }
         let viewer_idx = self.viewer.as_ref().map(|v| v.idx);
         self.reload(None);
@@ -590,7 +757,7 @@ impl App {
             let n = self.entries.len();
             let next = (idx.min(n.saturating_sub(1))..n)
                 .chain((0..idx.min(n)).rev())
-                .find(|&i| !self.entries[i].is_dir);
+                .find(|&i| self.entries[i].is_img());
             match next {
                 Some(i) => {
                     self.viewer = Some(Viewer { idx: i, zoom: None, pan: Vec2::ZERO });
@@ -602,8 +769,57 @@ impl App {
     }
 
     fn ask_rename(&mut self) {
-        if let Some(e) = self.focus.and_then(|i| self.entries.get(i)) {
-            self.dialog = Some(Dialog::Rename { path: e.path.clone(), text: e.name.clone(), first: true });
+        if let Some(p) = self.focus.and_then(|i| self.entries.get(i)).map(|e| e.path.clone()) {
+            self.ask_rename_path(p);
+        }
+    }
+
+    fn ask_rename_path(&mut self, path: PathBuf) {
+        if let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
+            self.dialog = Some(Dialog::Rename { path, text: name, first: true });
+        }
+    }
+
+    fn ask_new_folder(&mut self, parent: PathBuf) {
+        let mut name = "새 폴더".to_string();
+        let mut k = 2;
+        while parent.join(&name).exists() {
+            name = format!("새 폴더 ({k})");
+            k += 1;
+        }
+        self.dialog = Some(Dialog::NewFolder { parent, text: name, first: true });
+    }
+
+    fn do_new_folder(&mut self, parent: PathBuf, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let target = parent.join(name);
+        if target.exists() {
+            self.status = format!("이미 있는 이름입니다: {name}");
+            return;
+        }
+        match std::fs::create_dir(&target) {
+            Ok(()) => {
+                self.status = format!("폴더를 만들었습니다: {name}");
+                self.tree_children.remove(&parent);
+                let mut st = CollapsingState::load_with_default_open(&self.ctx, tree_id(&parent), false);
+                st.set_open(true);
+                st.store(&self.ctx);
+                if parent == self.cur_dir {
+                    self.reload(Some(target));
+                }
+            }
+            Err(e) => self.status = format!("폴더 만들기 실패: {e}"),
+        }
+    }
+
+    /// Forget cached tree children under `d` and re-read the grid if it shows `d`.
+    fn refresh_dir(&mut self, d: &Path) {
+        self.tree_children.retain(|k, _| !k.starts_with(d));
+        if self.cur_dir == d {
+            self.reload(None);
         }
     }
 
@@ -625,9 +841,160 @@ impl App {
                 if let Some(r) = self.rot.remove(&path) {
                     self.rot.insert(to.clone(), r);
                 }
-                self.reload(Some(to));
+                if let Some(parent) = path.parent() {
+                    self.tree_children.remove(parent);
+                }
+                self.tree_children.retain(|k, _| !k.starts_with(&path));
+                for f in self.favorites.iter_mut().chain(self.recent.iter_mut()) {
+                    if let Ok(rest) = f.strip_prefix(&path) {
+                        *f = if rest.as_os_str().is_empty() { to.clone() } else { to.join(rest) };
+                    }
+                }
+                // renamed the folder being shown, or one above it
+                if let Ok(rest) = self.cur_dir.clone().strip_prefix(&path) {
+                    let new = if rest.as_os_str().is_empty() { to.clone() } else { to.join(rest) };
+                    self.navigate(new, false);
+                } else if path.parent() == Some(self.cur_dir.as_path()) {
+                    self.reload(Some(to));
+                }
             }
             Err(e) => self.status = format!("이름 바꾸기 실패: {e}"),
+        }
+    }
+
+    fn run_actions(&mut self) {
+        for a in std::mem::take(&mut self.actions) {
+            self.run(a);
+        }
+    }
+
+    fn run(&mut self, a: Action) {
+        match a {
+            Action::Open(i) => self.open_entry(i),
+            Action::Go(p) => self.navigate(p, true),
+            Action::NewFolder(parent) => self.ask_new_folder(parent),
+            Action::AddFavorite(p) => {
+                if !self.favorites.contains(&p) {
+                    self.favorites.push(p);
+                }
+            }
+            Action::RemoveFavorite(p) => self.favorites.retain(|f| f != &p),
+            Action::Cut(ps) | Action::Copy(ps) if ps.is_empty() => {}
+            Action::Cut(ps) => match fileops::clipboard_set_files(&ps, true) {
+                Ok(()) => {
+                    self.status = format!("{}개 항목을 잘라냈습니다", ps.len());
+                    self.cut_paths = ps.into_iter().collect();
+                }
+                Err(e) => self.status = format!("잘라내기 실패: {e}"),
+            },
+            Action::Copy(ps) => match fileops::clipboard_set_files(&ps, false) {
+                Ok(()) => {
+                    self.status = format!("{}개 항목을 복사했습니다", ps.len());
+                    self.cut_paths.clear();
+                }
+                Err(e) => self.status = format!("복사 실패: {e}"),
+            },
+            Action::Paste(dest) => self.paste(dest),
+            Action::Delete(ps) => self.ask_delete(ps),
+            Action::Rename(p) => self.ask_rename_path(p),
+            Action::Properties(p) => fileops::show_properties(&p),
+            Action::Refresh(d) => self.refresh_dir(&d),
+            Action::Rotate(ps, d) => self.rotate_paths(ps, d),
+            Action::ShowInExplorer(p) => self.show_in_explorer(&p),
+        }
+    }
+
+    fn paste(&mut self, dest: PathBuf) {
+        let Some((files, cut)) = fileops::clipboard_get_files() else {
+            self.status = "붙여넣을 파일이 없습니다".into();
+            return;
+        };
+        if cut && files.iter().all(|f| f.parent() == Some(dest.as_path())) {
+            self.status = "같은 폴더라서 옮길 것이 없습니다".into();
+            return;
+        }
+        if files.iter().any(|f| dest.starts_with(f)) {
+            self.status = "폴더를 그 안으로 복사하거나 옮길 수 없습니다".into();
+            return;
+        }
+        let mut dirs = vec![dest.clone()];
+        if cut {
+            dirs.extend(files.iter().filter_map(|f| f.parent().map(Path::to_path_buf)));
+        }
+        dirs.sort();
+        dirs.dedup();
+        let n = files.len();
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.status = "붙여넣는 중…".into();
+        std::thread::spawn(move || {
+            let res = fileops::shell_copy_move(&files, &dest, cut);
+            let status = match &res {
+                Ok(true) => format!("{n}개 항목을 {}습니다", if cut { "옮겼" } else { "복사했" }),
+                Ok(false) => "붙여넣기를 일부 취소했습니다".into(),
+                Err(e) => format!("붙여넣기 실패: {e}"),
+            };
+            let clear_clipboard = cut && matches!(res, Ok(true));
+            let _ = tx.send(Msg::OpDone { status, dirs, clear_clipboard });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Explorer-style menu. `targets` are the right-clicked items (empty = blank
+    /// area); `dir` is the folder that "new folder", "paste" and "refresh" use.
+    fn file_menu(&mut self, ui: &mut Ui, targets: Vec<PathBuf>, dir: PathBuf) {
+        let one_dir = (targets.len() == 1 && targets[0].is_dir()).then(|| targets[0].clone());
+        let fav_target = one_dir.clone().or_else(|| targets.is_empty().then(|| dir.clone()));
+        let paste_dir = one_dir.clone().unwrap_or_else(|| dir.clone());
+        let any = !targets.is_empty();
+        let deletable = any && targets.iter().all(|p| p.parent().is_some());
+        let mut act: Option<Action> = None;
+        let item = |ui: &mut Ui, enabled: bool, text: &str, key: &str| {
+            ui.add_enabled(enabled, egui::Button::new(text).shortcut_text(key)).clicked()
+        };
+        ui.set_min_width(220.0);
+
+        if item(ui, true, "폴더 생성(N)", "Ctrl+N") {
+            act = Some(Action::NewFolder(paste_dir.clone()));
+        }
+        match &fav_target {
+            Some(f) if self.favorites.contains(f) => {
+                if item(ui, true, "즐겨찾기에서 제거(A)", "") {
+                    act = Some(Action::RemoveFavorite(f.clone()));
+                }
+            }
+            _ => {
+                if item(ui, fav_target.is_some(), "즐겨찾기에 추가(A)", "") {
+                    act = fav_target.clone().map(Action::AddFavorite);
+                }
+            }
+        }
+        ui.separator();
+        if item(ui, deletable, "잘라내기(X)", "Ctrl+X") {
+            act = Some(Action::Cut(targets.clone()));
+        }
+        if item(ui, any, "복사(C)", "Ctrl+C") {
+            act = Some(Action::Copy(targets.clone()));
+        }
+        if item(ui, fileops::clipboard_has_files(), "붙여넣기(V)", "Ctrl+V") {
+            act = Some(Action::Paste(paste_dir.clone()));
+        }
+        ui.separator();
+        if item(ui, deletable, "삭제(D)", "Del") {
+            act = Some(Action::Delete(targets.clone()));
+        }
+        if item(ui, targets.len() == 1 && deletable, "이름 변경(U)", "F2") {
+            act = Some(Action::Rename(targets[0].clone()));
+        }
+        ui.separator();
+        if item(ui, true, "파일 속성(Z)", "") {
+            act = Some(Action::Properties(targets.first().cloned().unwrap_or_else(|| dir.clone())));
+        }
+        if item(ui, true, "새로고침(Y)", "F5") {
+            act = Some(Action::Refresh(dir.clone()));
+        }
+        if let Some(a) = act {
+            self.actions.push(a);
+            ui.close_menu();
         }
     }
 
@@ -673,6 +1040,7 @@ impl App {
             if r.clicked() {
                 *nav = Some(path.to_path_buf());
             }
+            r.context_menu(|ui| self.file_menu(ui, vec![path.to_path_buf()], path.to_path_buf()));
             if selected && self.tree_scroll_pending {
                 r.scroll_to_me(Some(Align::Center));
                 self.tree_scroll_pending = false;
@@ -725,8 +1093,25 @@ impl App {
             return;
         }
         if pressed(Key::F5) {
-            self.reload(None);
+            self.actions.push(Action::Refresh(self.cur_dir.clone()));
             return;
+        }
+        if mods.command && pressed(Key::N) {
+            self.actions.push(Action::NewFolder(self.cur_dir.clone()));
+            return;
+        }
+        // egui turns Ctrl+C / Ctrl+X into these events instead of key presses
+        let (copy, cut) = ctx.input(|i| {
+            (
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+            )
+        });
+        if copy {
+            self.actions.push(Action::Copy(self.selected_paths()));
+        }
+        if cut {
+            self.actions.push(Action::Cut(self.selected_paths()));
         }
         let n = self.entries.len();
         if n == 0 {
@@ -762,11 +1147,12 @@ impl App {
             }
         }
         if pressed(Key::Delete) {
-            let p = self.selected_paths();
-            self.ask_delete(p);
+            self.actions.push(Action::Delete(self.selected_paths()));
         }
         if pressed(Key::F2) {
-            self.ask_rename();
+            if let Some(p) = self.focus.and_then(|i| self.entries.get(i)).map(|e| e.path.clone()) {
+                self.actions.push(Action::Rename(p));
+            }
         }
     }
 
@@ -805,7 +1191,7 @@ impl App {
             }
             ui.separator();
 
-            let has_img = self.focus.and_then(|i| self.entries.get(i)).map(|e| !e.is_dir).unwrap_or(false);
+            let has_img = self.focus.and_then(|i| self.entries.get(i)).map(|e| e.is_img()).unwrap_or(false);
             let has_sel = !self.selected_paths().is_empty();
             if ui.add_enabled(has_img, egui::Button::new("크게보기")).on_hover_text("Enter").clicked() {
                 if let Some(f) = self.focus {
@@ -873,7 +1259,13 @@ impl App {
             }
             ui.separator();
             ui.label("크기");
+            if ui.button(" - ").on_hover_text("작게").clicked() {
+                self.thumb_size = (self.thumb_size - 16.0).max(64.0);
+            }
             ui.add(egui::Slider::new(&mut self.thumb_size, 64.0..=256.0).show_value(false));
+            if ui.button(" + ").on_hover_text("크게").clicked() {
+                self.thumb_size = (self.thumb_size + 16.0).min(256.0);
+            }
         });
     }
 
@@ -897,8 +1289,13 @@ impl App {
             let sel_size: u64 = self.selected.iter().filter_map(|&i| self.entries.get(i)).map(|e| e.size).sum();
             ui.label(format!("{} 개체 선택 ({})", self.selected.len(), fmt_size(sel_size)));
             ui.separator();
-            let imgs = self.entries.iter().filter(|e| !e.is_dir).count();
-            ui.label(format!("총 {} 개체 (그림 {imgs})", self.entries.len()));
+            let imgs = self.entries.iter().filter(|e| e.is_img()).count();
+            let media = self.entries.iter().filter(|e| e.media.is_some()).count();
+            if media > 0 {
+                ui.label(format!("총 {} 개체 (그림 {imgs}, 동영상·음성 {media})", self.entries.len()));
+            } else {
+                ui.label(format!("총 {} 개체 (그림 {imgs})", self.entries.len()));
+            }
             if !self.status.is_empty() {
                 ui.separator();
                 ui.colored_label(Color32::from_rgb(180, 60, 20), &self.status);
@@ -922,9 +1319,38 @@ impl App {
                 }
             }
         });
+        if !self.favorites.is_empty() {
+            ui.add_space(4.0);
+            ui.weak("즐겨찾기");
+            for f in self.favorites.clone() {
+                let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| f.display().to_string());
+                let r = ui.selectable_label(self.cur_dir == f, format!("★ {name}")).on_hover_text(f.display().to_string());
+                if r.clicked() {
+                    self.actions.push(Action::Go(f.clone()));
+                }
+                r.context_menu(|ui| {
+                    if ui.button("열기").clicked() {
+                        self.actions.push(Action::Go(f.clone()));
+                        ui.close_menu();
+                    }
+                    if ui.button("즐겨찾기에서 제거").clicked() {
+                        self.actions.push(Action::RemoveFavorite(f.clone()));
+                        ui.close_menu();
+                    }
+                });
+            }
+        }
     }
 
     fn grid(&mut self, ui: &mut Ui) {
+        // blank area: clicking clears the selection, right-click opens the folder menu.
+        // Cells are registered later, so they get their own clicks first.
+        let bg = ui.interact(ui.max_rect(), Id::new("grid_bg"), Sense::click());
+        if bg.clicked() {
+            self.selected.clear();
+        }
+        let dir = self.cur_dir.clone();
+        bg.context_menu(|ui| self.file_menu(ui, Vec::new(), dir.clone()));
         let n = self.entries.len();
         if n == 0 {
             ui.centered_and_justified(|ui| ui.weak("그림이 없습니다"));
@@ -1049,7 +1475,7 @@ impl App {
         } else {
             match &self.thumbs[i] {
                 Thumb::Ready(t) => {
-                    draw_image(ui, t, t.size_vec2(), img_area, self.rot_of(&e.path), None, Vec2::ZERO);
+                    draw_image(ui, t, t.size_vec2(), img_area, self.disp_rot(&e.path, t), None, Vec2::ZERO);
                 }
                 Thumb::Failed => {
                     painter.text(img_area.center(), Align2::CENTER_CENTER, "읽을 수 없음", FontId::proportional(12.0), Color32::GRAY);
@@ -1057,6 +1483,12 @@ impl App {
                 _ => {
                     painter.rect_filled(img_area.shrink(ts * 0.3), 4.0, Color32::from_gray(238));
                 }
+            }
+            if let Some(m) = e.media {
+                let badge = Rect::from_min_size(img_area.left_bottom() - vec2(0.0, 26.0), vec2(30.0, 24.0));
+                painter.rect_filled(badge, 4.0f32, Color32::from_black_alpha(170));
+                let mark = if m == loader::Media::Video { "▶" } else { "♪" };
+                painter.text(badge.center(), Align2::CENTER_CENTER, mark, FontId::proportional(15.0), Color32::WHITE);
             }
         }
 
@@ -1073,7 +1505,7 @@ impl App {
         ui.painter().galley(pos2(rect.center().x, rect.max.y - 22.0), galley, Color32::BLACK);
 
         let path = e.path.clone();
-        let is_dir = e.is_dir;
+        let is_img = e.is_img();
         if resp.double_clicked() {
             // opening a folder replaces `entries`; doing it mid-grid made the
             // remaining cells index past the new, shorter list
@@ -1084,23 +1516,32 @@ impl App {
         } else if resp.secondary_clicked() && !selected {
             self.select_single(i);
         }
+        if self.cut_paths.contains(&path) {
+            ui.painter().rect_filled(rect, 4.0f32, Color32::from_white_alpha(150));
+        }
+        let targets = if selected { self.selected_paths() } else { vec![path.clone()] };
         resp.context_menu(|ui| {
-            if ui.button(if is_dir { "열기" } else { "크게보기" }).clicked() {
-                self.pending_open = Some(i);
+            let open = egui::RichText::new(if is_img { "크게보기" } else { "열기" }).strong();
+            if ui.add(egui::Button::new(open).shortcut_text("Enter")).clicked() {
+                self.actions.push(Action::Open(i));
                 ui.close_menu();
             }
-            if ui.button("이름 바꾸기 (F2)").clicked() {
-                self.select_single(i);
-                self.ask_rename();
-                ui.close_menu();
+            if is_img {
+                if ui.add(egui::Button::new("시계 방향으로 회전").shortcut_text("R")).clicked() {
+                    self.actions.push(Action::Rotate(targets.clone(), 1));
+                    ui.close_menu();
+                }
+                if ui.add(egui::Button::new("시계 반대 방향으로 회전").shortcut_text("L")).clicked() {
+                    self.actions.push(Action::Rotate(targets.clone(), -1));
+                    ui.close_menu();
+                }
             }
-            if !is_dir && ui.button("삭제 (휴지통)").clicked() {
-                let p = self.selected_paths();
-                self.ask_delete(p);
-                ui.close_menu();
-            }
+            ui.separator();
+            let dir = self.cur_dir.clone();
+            self.file_menu(ui, targets.clone(), dir);
+            ui.separator();
             if ui.button("탐색기에서 보기").clicked() {
-                self.show_in_explorer(&path);
+                self.actions.push(Action::ShowInExplorer(path.clone()));
                 ui.close_menu();
             }
             if ui.button("경로 복사").clicked() {
@@ -1123,18 +1564,35 @@ impl App {
             ui.weak("폴더");
             return;
         }
+        if let Some(m) = e.media {
+            let area_h = (ui.available_height() - 110.0).max(60.0);
+            let (area, resp) = ui.allocate_exact_size(vec2(ui.available_width(), area_h), Sense::click());
+            if let Thumb::Ready(t) = &self.thumbs[i] {
+                draw_image(ui, t, t.size_vec2(), area, 0, None, Vec2::ZERO);
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(&e.name).strong());
+            ui.label(if m == loader::Media::Video { "동영상" } else { "음성" });
+            ui.label(fmt_size(e.size));
+            ui.label(fmt_time(e.modified));
+            ui.weak("두 번 누르면 기본 프로그램으로 엽니다");
+            if resp.double_clicked() {
+                self.actions.push(Action::Open(i));
+            }
+            return;
+        }
         let area_h = (ui.available_height() - 90.0).max(60.0);
         let (area, resp) = ui.allocate_exact_size(vec2(ui.available_width(), area_h), Sense::click());
-        let rot = self.rot_of(&e.path);
         match (self.big.get(&e.path), &self.thumbs[i]) {
             (Some(Big::Ready(t, d)), _) => {
-                draw_image(ui, t, vec2(d[0] as f32, d[1] as f32), area, rot, None, Vec2::ZERO);
+                draw_image(ui, t, vec2(d[0] as f32, d[1] as f32), area, self.disp_rot(&e.path, t), None, Vec2::ZERO);
             }
             (Some(Big::Failed), _) => {
                 ui.painter().text(area.center(), Align2::CENTER_CENTER, "열 수 없는 그림", FontId::proportional(14.0), Color32::GRAY);
             }
             (_, Thumb::Ready(t)) => {
                 // thumbnail stands in until the full image arrives
+                let rot = self.disp_rot(&e.path, t);
                 let size = self.focus_dims.map(|d| vec2(d[0] as f32, d[1] as f32)).filter(|_| rot == 0).unwrap_or(t.size_vec2());
                 draw_image(ui, t, fit_aspect(size, t.size_vec2()), area, rot, None, Vec2::ZERO);
             }
@@ -1178,7 +1636,7 @@ impl App {
         }
 
         // load the full picture for the preview once the focus settles
-        if let Some(p) = self.focus.and_then(|i| self.entries.get(i)).filter(|e| !e.is_dir).map(|e| e.path.clone()) {
+        if let Some(p) = self.focus.and_then(|i| self.entries.get(i)).filter(|e| e.is_img()).map(|e| e.path.clone()) {
             if !self.big.contains_key(&p) {
                 let el = self.focus_time.elapsed();
                 if el >= PREVIEW_DELAY {
@@ -1196,7 +1654,7 @@ impl App {
         let n = self.entries.len() as isize;
         let mut i = from as isize + dir;
         while i >= 0 && i < n {
-            if !self.entries[i as usize].is_dir {
+            if self.entries[i as usize].is_img() {
                 return Some(i as usize);
             }
             i += dir;
@@ -1236,10 +1694,10 @@ impl App {
                 go = self.neighbor_image(idx, -1);
             }
             if pressed(Key::Home) {
-                go = (0..self.entries.len()).find(|&i| !self.entries[i].is_dir);
+                go = (0..self.entries.len()).find(|&i| self.entries[i].is_img());
             }
             if pressed(Key::End) {
-                go = (0..self.entries.len()).rev().find(|&i| !self.entries[i].is_dir);
+                go = (0..self.entries.len()).rev().find(|&i| self.entries[i].is_img());
             }
             if pressed(Key::R) {
                 self.rotate_current(if mods.shift { -1 } else { 1 });
@@ -1283,9 +1741,8 @@ impl App {
         }
         self.request_big(&cur);
 
-        let total = self.entries.iter().filter(|e| !e.is_dir).count();
-        let pos = self.entries[..=idx].iter().filter(|e| !e.is_dir).count();
-        let rot = self.rot_of(&cur);
+        let total = self.entries.iter().filter(|e| e.is_img()).count();
+        let pos = self.entries[..=idx].iter().filter(|e| e.is_img()).count();
         let name = self.entries[idx].name.clone();
 
         egui::CentralPanel::default()
@@ -1300,8 +1757,9 @@ impl App {
 
                 match self.big.get(&cur) {
                     Some(Big::Ready(t, d)) => {
+                        let rot = self.rot_of(&cur) + self.baked.get(&t.id()).copied().unwrap_or(0);
                         let img = vec2(d[0] as f32, d[1] as f32);
-                        let rimg = if rot % 2 == 1 { vec2(img.y, img.x) } else { img };
+                        let rimg = if rot.rem_euclid(2) == 1 { vec2(img.y, img.x) } else { img };
                         let v = self.viewer.as_mut().unwrap();
                         let fit = fit_scale(rimg, area.size());
                         let mut scale = v.zoom.unwrap_or(fit);
@@ -1337,6 +1795,7 @@ impl App {
                     }
                     _ => {
                         if let Thumb::Ready(t) = &self.thumbs[idx] {
+                            let rot = self.disp_rot(&cur, t);
                             let s = t.size_vec2();
                             let big = s * (area.width() / s.x).min(area.height() / s.y) * 0.9;
                             draw_image(ui, t, big, area, rot, None, Vec2::ZERO);
@@ -1379,9 +1838,9 @@ impl App {
                     .show(ctx, |ui| {
                         if paths.len() == 1 {
                             let n = paths[0].file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                            ui.label(format!("'{n}' 파일을 휴지통으로 보낼까요?"));
+                            ui.label(format!("'{n}'을(를) 휴지통으로 보낼까요?"));
                         } else {
-                            ui.label(format!("{}개 파일을 휴지통으로 보낼까요?", paths.len()));
+                            ui.label(format!("{}개 항목을 휴지통으로 보낼까요?", paths.len()));
                         }
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
@@ -1437,6 +1896,39 @@ impl App {
                     None => self.dialog = Some(Dialog::Rename { path, text, first: false }),
                 }
             }
+            Dialog::NewFolder { parent, mut text, first } => {
+                let mut result: Option<bool> = None;
+                egui::Window::new("폴더 생성")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.weak(parent.display().to_string());
+                        let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(320.0));
+                        if first {
+                            r.request_focus();
+                        }
+                        if r.lost_focus() && enter {
+                            result = Some(true);
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("만들기").clicked() {
+                                result = Some(true);
+                            }
+                            if ui.button("취소").clicked() {
+                                result = Some(false);
+                            }
+                        });
+                    });
+                if esc {
+                    result = Some(false);
+                }
+                match result {
+                    Some(true) => self.do_new_folder(parent, &text),
+                    Some(false) => {}
+                    None => self.dialog = Some(Dialog::NewFolder { parent, text, first: false }),
+                }
+            }
         }
     }
 }
@@ -1449,18 +1941,26 @@ impl eframe::App for App {
             sort: self.sort,
             sort_desc: self.sort_desc,
             thumb_size: self.thumb_size,
+            favorites: self.favorites.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &s);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_msgs();
+        // Ctrl+V: egui only reports it when the clipboard holds text
+        let v = ctx.input(|i| i.focused) && fileops::ctrl_v_down();
+        if v && !self.ctrl_v_prev && self.viewer.is_none() && !self.modal_open() && !ctx.wants_keyboard_input() {
+            self.actions.push(Action::Paste(self.cur_dir.clone()));
+        }
+        self.ctrl_v_prev = v;
         if self.viewer.is_some() {
             self.viewer_ui(ctx);
         } else {
             self.browser_ui(ctx);
         }
         self.dialogs(ctx);
+        self.run_actions();
         self.evict_thumbs();
     }
 }
@@ -1549,13 +2049,15 @@ fn list_dir(dir: &Path) -> std::io::Result<Vec<Entry>> {
         }
         let path = de.path();
         let is_dir = md.is_dir();
-        if !is_dir && !loader::is_image(&path) {
+        let media = if is_dir { None } else { loader::media_kind(&path) };
+        if !is_dir && media.is_none() && !loader::is_image(&path) {
             continue;
         }
         v.push(Entry {
             name: de.file_name().to_string_lossy().into_owned(),
             path,
             is_dir,
+            media,
             size: if is_dir { 0 } else { md.len() },
             modified: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         });
