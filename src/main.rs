@@ -1,0 +1,1644 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod cache;
+mod loader;
+
+use eframe::egui::{
+    self, collapsing_header::CollapsingState, load::SizedTexture, pos2, text::LayoutJob, vec2,
+    Align, Align2, Color32, ColorImage, FontFamily, FontId, Id, Key, Rect, Sense, Stroke,
+    TextFormat, TextureHandle, TextureOptions, Ui, Vec2,
+};
+use std::cmp::Ordering as CmpOrd;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant, SystemTime};
+
+const GAP: f32 = 8.0;
+const MAX_THUMBS_LOADED: usize = 800;
+const BIG_CACHE: usize = 8;
+const SCROLL_ANIM: Duration = Duration::from_millis(120);
+const PREVIEW_DELAY: Duration = Duration::from_millis(120);
+
+// ---------------------------------------------------------------- data types
+
+struct Entry {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    size: u64,
+    modified: SystemTime,
+}
+
+enum Thumb {
+    None,
+    Pending,
+    Ready(TextureHandle),
+    Failed,
+}
+
+enum Big {
+    Pending,
+    Ready(TextureHandle, [u32; 2]),
+    Failed,
+}
+
+enum Msg {
+    Thumb { gen: u64, idx: usize, tex: TextureHandle },
+    ThumbFail { gen: u64, idx: usize },
+    Skip { gen: u64, idx: usize },
+    Big { path: PathBuf, res: Result<(TextureHandle, [u32; 2]), String> },
+}
+
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+enum SortKey {
+    Name,
+    Date,
+    Size,
+}
+
+const RECENT_MAX: usize = 10;
+
+/// Saved between runs (eframe storage, %APPDATA%/picview/data/app.ron).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Settings {
+    last_dir: Option<PathBuf>,
+    recent: Vec<PathBuf>,
+    sort: SortKey,
+    sort_desc: bool,
+    thumb_size: f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { last_dir: None, recent: Vec::new(), sort: SortKey::Name, sort_desc: false, thumb_size: 160.0 }
+    }
+}
+
+struct Viewer {
+    idx: usize,
+    zoom: Option<f32>, // None = fit to window
+    pan: Vec2,
+}
+
+enum Dialog {
+    Delete(Vec<PathBuf>),
+    Rename { path: PathBuf, text: String, first: bool },
+}
+
+// ---------------------------------------------------------------- app
+
+struct App {
+    ctx: egui::Context,
+    cur_dir: PathBuf,
+    addr_text: String,
+    entries: Vec<Entry>,
+    thumbs: Vec<Thumb>,
+    thumbs_loaded: usize,
+
+    gen: Arc<AtomicU64>,
+    vis_start: Arc<AtomicUsize>,
+    vis_end: Arc<AtomicUsize>,
+    tx: mpsc::Sender<Msg>,
+    rx: mpsc::Receiver<Msg>,
+
+    selected: BTreeSet<usize>,
+    anchor: Option<usize>,
+    focus: Option<usize>,
+    focus_time: Instant,
+    focus_dims: Option<[u32; 2]>,
+
+    back: Vec<PathBuf>,
+    fwd: Vec<PathBuf>,
+
+    thumb_size: f32,
+    cols: usize,
+    grid_offset: f32,
+    grid_view_h: f32,
+    grid_scroll_to: Option<f32>,
+    wheel_acc: f32,
+    scroll_anim: Option<(f32, f32, Instant)>, // from, to, start
+
+    sort: SortKey,
+    sort_desc: bool,
+
+    big: HashMap<PathBuf, Big>,
+    big_order: VecDeque<PathBuf>,
+    rot: HashMap<PathBuf, i32>,
+
+    viewer: Option<Viewer>,
+    fullscreen: bool,
+    dialog: Option<Dialog>,
+    status: String,
+
+    drives: Vec<PathBuf>,
+    tree_children: HashMap<PathBuf, Vec<PathBuf>>,
+    tree_scroll_pending: bool,
+    pending_open: Option<usize>,
+    recent: Vec<PathBuf>,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>, start: Option<PathBuf>) -> Self {
+        setup_fonts(&cc.egui_ctx);
+        std::thread::spawn(cache::trim);
+        cc.egui_ctx.set_visuals(egui::Visuals::light());
+        let (tx, rx) = mpsc::channel();
+
+        let drives = ('A'..='Z')
+            .map(|c| PathBuf::from(format!("{c}:\\")))
+            .filter(|p| p.exists())
+            .collect();
+
+        let saved: Settings = cc.storage.and_then(|st| eframe::get_value(st, eframe::APP_KEY)).unwrap_or_default();
+        let mut app = App {
+            ctx: cc.egui_ctx.clone(),
+            cur_dir: PathBuf::new(),
+            addr_text: String::new(),
+            entries: Vec::new(),
+            thumbs: Vec::new(),
+            thumbs_loaded: 0,
+            gen: Arc::new(AtomicU64::new(0)),
+            vis_start: Arc::new(AtomicUsize::new(0)),
+            vis_end: Arc::new(AtomicUsize::new(0)),
+            tx,
+            rx,
+            selected: BTreeSet::new(),
+            anchor: None,
+            focus: None,
+            focus_time: Instant::now(),
+            focus_dims: None,
+            back: Vec::new(),
+            fwd: Vec::new(),
+            thumb_size: saved.thumb_size.clamp(64.0, 256.0),
+            cols: 1,
+            grid_offset: 0.0,
+            grid_view_h: 600.0,
+            grid_scroll_to: None,
+            wheel_acc: 0.0,
+            scroll_anim: None,
+            sort: saved.sort,
+            sort_desc: saved.sort_desc,
+            big: HashMap::new(),
+            big_order: VecDeque::new(),
+            rot: HashMap::new(),
+            viewer: None,
+            fullscreen: false,
+            dialog: None,
+            status: String::new(),
+            drives,
+            tree_children: HashMap::new(),
+            tree_scroll_pending: false,
+            pending_open: None,
+            recent: saved.recent.into_iter().filter(|p| p.is_dir()).take(RECENT_MAX).collect(),
+        };
+
+        let home = std::env::var("USERPROFILE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:\\"));
+        match start {
+            Some(p) if p.is_file() => {
+                let p = normalize(p);
+                if let Some(parent) = p.parent() {
+                    app.navigate(parent.to_path_buf(), false);
+                }
+                if let Some(i) = app.index_of(&p) {
+                    app.select_single(i);
+                    app.viewer = Some(Viewer { idx: i, zoom: None, pan: Vec2::ZERO });
+                }
+            }
+            Some(p) if p.is_dir() => app.navigate(p, false),
+            _ => match saved.last_dir.filter(|d| d.is_dir()) {
+                Some(d) => app.navigate(d, false),
+                None => {
+                    let pics = home.join("Pictures");
+                    app.navigate(if pics.is_dir() { pics } else { home }, false);
+                }
+            },
+        }
+        app
+    }
+
+    // ------------------------------------------------------------ navigation
+
+    fn navigate(&mut self, dir: PathBuf, push_history: bool) {
+        let dir = normalize(dir);
+        let entries = match list_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                self.status = format!("폴더를 열 수 없습니다: {e}");
+                return;
+            }
+        };
+        if push_history && !self.cur_dir.as_os_str().is_empty() && self.cur_dir != dir {
+            self.back.push(self.cur_dir.clone());
+            self.fwd.clear();
+        }
+        self.status.clear();
+        self.recent.retain(|p| p != &dir);
+        self.recent.insert(0, dir.clone());
+        self.recent.truncate(RECENT_MAX);
+        self.cur_dir = dir.clone();
+        self.addr_text = dir.display().to_string();
+        self.entries = entries;
+        self.thumbs = (0..self.entries.len()).map(|_| Thumb::None).collect();
+        self.thumbs_loaded = 0;
+        self.gen.fetch_add(1, Ordering::SeqCst);
+        self.sort_entries();
+        self.selected.clear();
+        self.anchor = None;
+        self.focus = None;
+        self.focus_dims = None;
+        self.grid_scroll_to = Some(0.0);
+        self.open_tree_to(&dir);
+    }
+
+    /// Re-read the current folder, keeping already made thumbnails.
+    fn reload(&mut self, focus_path: Option<PathBuf>) {
+        let Ok(entries) = list_dir(&self.cur_dir) else { return };
+        let mut old: HashMap<PathBuf, TextureHandle> = HashMap::new();
+        for (e, t) in self.entries.iter().zip(self.thumbs.drain(..)) {
+            if let Thumb::Ready(tex) = t {
+                old.insert(e.path.clone(), tex);
+            }
+        }
+        let old_focus = self.focus;
+        self.entries = entries;
+        self.thumbs = self
+            .entries
+            .iter()
+            .map(|e| old.remove(&e.path).map(Thumb::Ready).unwrap_or(Thumb::None))
+            .collect();
+        self.thumbs_loaded = self.thumbs.iter().filter(|t| matches!(t, Thumb::Ready(_))).count();
+        self.gen.fetch_add(1, Ordering::SeqCst);
+        self.sort_entries();
+        self.selected.clear();
+        let n = self.entries.len();
+        let target = focus_path
+            .and_then(|p| self.index_of(&p))
+            .or_else(|| old_focus.filter(|_| n > 0).map(|f| f.min(n - 1)));
+        match target {
+            Some(i) => self.select_single(i),
+            None => {
+                self.focus = None;
+                self.anchor = None;
+            }
+        }
+        self.tree_children.remove(&self.cur_dir);
+    }
+
+    fn go_back(&mut self) {
+        if let Some(p) = self.back.pop() {
+            self.fwd.push(self.cur_dir.clone());
+            self.navigate(p, false);
+        }
+    }
+
+    fn go_fwd(&mut self) {
+        if let Some(p) = self.fwd.pop() {
+            self.back.push(self.cur_dir.clone());
+            self.navigate(p, false);
+        }
+    }
+
+    fn go_up(&mut self) {
+        let cur = self.cur_dir.clone();
+        if let Some(parent) = cur.parent() {
+            self.navigate(parent.to_path_buf(), true);
+            if let Some(i) = self.index_of(&cur) {
+                self.select_single(i);
+            }
+        }
+    }
+
+    fn open_address(&mut self) {
+        let p = PathBuf::from(self.addr_text.trim().trim_matches('"'));
+        if p.is_file() {
+            let p = normalize(p);
+            if let Some(parent) = p.parent() {
+                self.navigate(parent.to_path_buf(), true);
+            }
+            if let Some(i) = self.index_of(&p) {
+                self.select_single(i);
+            }
+        } else {
+            self.navigate(p, true);
+        }
+    }
+
+    fn open_entry(&mut self, i: usize) {
+        let Some(e) = self.entries.get(i) else { return };
+        if e.is_dir {
+            let p = e.path.clone();
+            self.navigate(p, true);
+        } else {
+            self.viewer = Some(Viewer { idx: i, zoom: None, pan: Vec2::ZERO });
+        }
+    }
+
+    fn index_of(&self, p: &Path) -> Option<usize> {
+        self.entries.iter().position(|e| e.path == p)
+    }
+
+    fn sort_entries(&mut self) {
+        let focus_path = self.focus.and_then(|i| self.entries.get(i)).map(|e| e.path.clone());
+        let thumbs = std::mem::take(&mut self.thumbs);
+        let mut v: Vec<(Entry, Thumb)> = self.entries.drain(..).zip(thumbs).collect();
+        let (key, desc) = (self.sort, self.sort_desc);
+        v.sort_by(|(a, _), (b, _)| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| {
+                let o = match key {
+                    SortKey::Name => natural_cmp(&a.name, &b.name),
+                    SortKey::Date => a.modified.cmp(&b.modified),
+                    SortKey::Size => a.size.cmp(&b.size),
+                }
+                .then_with(|| natural_cmp(&a.name, &b.name));
+                if desc { o.reverse() } else { o }
+            })
+        });
+        for (e, t) in v {
+            // indices change: in-flight jobs become invalid
+            self.thumbs.push(if matches!(t, Thumb::Pending) { Thumb::None } else { t });
+            self.entries.push(e);
+        }
+        self.gen.fetch_add(1, Ordering::SeqCst);
+        if let Some(p) = focus_path {
+            if let Some(i) = self.index_of(&p) {
+                self.select_single(i);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ selection
+
+    fn set_focus(&mut self, i: usize) {
+        if self.focus != Some(i) {
+            self.focus = Some(i);
+            self.focus_time = Instant::now();
+            self.focus_dims = self
+                .entries
+                .get(i)
+                .filter(|e| !e.is_dir)
+                .and_then(|e| image::image_dimensions(&e.path).ok())
+                .map(|(w, h)| [w, h]);
+        }
+    }
+
+    fn select_single(&mut self, i: usize) {
+        self.selected.clear();
+        self.selected.insert(i);
+        self.anchor = Some(i);
+        self.set_focus(i);
+        self.ensure_visible(i);
+    }
+
+    fn move_focus(&mut self, t: usize, shift: bool) {
+        if shift {
+            let a = self.anchor.unwrap_or(t);
+            self.selected = (a.min(t)..=a.max(t)).collect();
+            self.set_focus(t);
+            self.ensure_visible(t);
+        } else {
+            self.select_single(t);
+        }
+    }
+
+    fn click_entry(&mut self, i: usize, mods: egui::Modifiers) {
+        if mods.command {
+            if !self.selected.insert(i) {
+                self.selected.remove(&i);
+            }
+            self.anchor = Some(i);
+            self.set_focus(i);
+        } else if mods.shift {
+            self.move_focus(i, true);
+        } else {
+            self.select_single(i);
+        }
+    }
+
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self.selected.iter().filter_map(|&i| self.entries.get(i)).map(|e| e.path.clone()).collect();
+        if v.is_empty() {
+            if let Some(e) = self.focus.and_then(|i| self.entries.get(i)) {
+                v.push(e.path.clone());
+            }
+        }
+        v
+    }
+
+    fn cell_size(&self) -> Vec2 {
+        vec2(self.thumb_size + 16.0, self.thumb_size + 16.0 + 22.0)
+    }
+
+    fn ensure_visible(&mut self, i: usize) {
+        let cell = self.cell_size();
+        let pitch = cell.y + GAP;
+        let top = (i / self.cols.max(1)) as f32 * pitch;
+        if top < self.grid_offset {
+            self.grid_scroll_to = Some(top);
+        } else if top + cell.y > self.grid_offset + self.grid_view_h {
+            self.grid_scroll_to = Some(top + cell.y - self.grid_view_h);
+        }
+    }
+
+    fn rot_of(&self, p: &Path) -> i32 {
+        self.rot.get(p).copied().unwrap_or(0)
+    }
+
+    fn rotate_current(&mut self, d: i32) {
+        let targets = match &self.viewer {
+            Some(v) => self.entries.get(v.idx).map(|e| vec![e.path.clone()]).unwrap_or_default(),
+            None => self.selected_paths(),
+        };
+        for p in targets {
+            let r = self.rot.entry(p).or_insert(0);
+            *r = (*r + d).rem_euclid(4);
+        }
+    }
+
+    // ------------------------------------------------------------ loading
+
+    fn request_thumb(&mut self, i: usize) {
+        let Some(e) = self.entries.get(i) else { return };
+        if e.is_dir || !matches!(self.thumbs[i], Thumb::None) {
+            return;
+        }
+        self.thumbs[i] = Thumb::Pending;
+        let (path, size, modified) = (e.path.clone(), e.size, e.modified);
+        let gen = self.gen.load(Ordering::SeqCst);
+        let (gen_now, vs, ve) = (self.gen.clone(), self.vis_start.clone(), self.vis_end.clone());
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        rayon::spawn(move || {
+            if gen_now.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            // user scrolled away before we got here: give up, it will be asked again
+            let (s, e) = (vs.load(Ordering::Relaxed), ve.load(Ordering::Relaxed));
+            if i + 120 < s || i > e + 120 {
+                let _ = tx.send(Msg::Skip { gen, idx: i });
+                ctx.request_repaint();
+                return;
+            }
+            let made = match cache::load(&path, size, modified) {
+                Some(img) => Ok(img),
+                None => loader::make_thumb(&path).inspect(|img| cache::store(&path, size, modified, img)),
+            };
+            let msg = match made {
+                Ok(img) => {
+                    let ci = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                    let tex = ctx.load_texture(format!("t{gen}/{i}"), ci, tex_opts());
+                    Msg::Thumb { gen, idx: i, tex }
+                }
+                Err(_) => Msg::ThumbFail { gen, idx: i },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    fn request_big(&mut self, path: &Path) {
+        if self.big.contains_key(path) {
+            if let Some(pos) = self.big_order.iter().position(|p| p == path) {
+                let p = self.big_order.remove(pos).unwrap();
+                self.big_order.push_back(p);
+            }
+            return;
+        }
+        self.big.insert(path.to_path_buf(), Big::Pending);
+        self.big_order.push_back(path.to_path_buf());
+        while self.big_order.len() > BIG_CACHE {
+            if let Some(old) = self.big_order.pop_front() {
+                self.big.remove(&old);
+            }
+        }
+        let path = path.to_path_buf();
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let max_side = ctx.input(|i| i.max_texture_side).min(16384) as u32;
+        std::thread::spawn(move || {
+            let res = loader::load_full(&path, max_side).map(|(img, dims)| {
+                let ci = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                (ctx.load_texture(path.display().to_string(), ci, tex_opts()), dims)
+            });
+            let _ = tx.send(Msg::Big { path, res });
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_msgs(&mut self) {
+        let gen = self.gen.load(Ordering::SeqCst);
+        let n = self.thumbs.len();
+        while let Ok(m) = self.rx.try_recv() {
+            match m {
+                Msg::Thumb { gen: g, idx, tex } if g == gen && idx < n => {
+                    self.thumbs[idx] = Thumb::Ready(tex);
+                    self.thumbs_loaded += 1;
+                }
+                Msg::ThumbFail { gen: g, idx } if g == gen && idx < n => self.thumbs[idx] = Thumb::Failed,
+                Msg::Skip { gen: g, idx } if g == gen && idx < n => {
+                    if matches!(self.thumbs[idx], Thumb::Pending) {
+                        self.thumbs[idx] = Thumb::None;
+                    }
+                }
+                Msg::Big { path, res } => {
+                    if let Some(b) = self.big.get_mut(&path) {
+                        *b = match res {
+                            Ok((t, d)) => Big::Ready(t, d),
+                            Err(_) => Big::Failed,
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn evict_thumbs(&mut self) {
+        if self.thumbs_loaded <= MAX_THUMBS_LOADED {
+            return;
+        }
+        let s = self.vis_start.load(Ordering::Relaxed).saturating_sub(300);
+        let e = self.vis_end.load(Ordering::Relaxed) + 300;
+        for (i, t) in self.thumbs.iter_mut().enumerate() {
+            if (i < s || i >= e) && matches!(t, Thumb::Ready(_)) {
+                *t = Thumb::None;
+                self.thumbs_loaded -= 1;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ file ops
+
+    fn ask_delete(&mut self, paths: Vec<PathBuf>) {
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_file()).collect();
+        if !paths.is_empty() {
+            self.dialog = Some(Dialog::Delete(paths));
+        }
+    }
+
+    fn do_delete(&mut self, paths: Vec<PathBuf>) {
+        match trash::delete_all(&paths) {
+            Ok(()) => self.status = format!("{}개 파일을 휴지통으로 보냈습니다", paths.len()),
+            Err(e) => self.status = format!("삭제 실패: {e}"),
+        }
+        for p in &paths {
+            self.big.remove(p);
+        }
+        let viewer_idx = self.viewer.as_ref().map(|v| v.idx);
+        self.reload(None);
+        if let Some(idx) = viewer_idx {
+            let n = self.entries.len();
+            let next = (idx.min(n.saturating_sub(1))..n)
+                .chain((0..idx.min(n)).rev())
+                .find(|&i| !self.entries[i].is_dir);
+            match next {
+                Some(i) => {
+                    self.viewer = Some(Viewer { idx: i, zoom: None, pan: Vec2::ZERO });
+                    self.select_single(i);
+                }
+                None => self.viewer = None,
+            }
+        }
+    }
+
+    fn ask_rename(&mut self) {
+        if let Some(e) = self.focus.and_then(|i| self.entries.get(i)) {
+            self.dialog = Some(Dialog::Rename { path: e.path.clone(), text: e.name.clone(), first: true });
+        }
+    }
+
+    fn do_rename(&mut self, path: PathBuf, new_name: &str) {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return;
+        }
+        let to = path.with_file_name(new_name);
+        if to == path {
+            return;
+        }
+        if to.exists() {
+            self.status = format!("이미 있는 이름입니다: {new_name}");
+            return;
+        }
+        match std::fs::rename(&path, &to) {
+            Ok(()) => {
+                if let Some(r) = self.rot.remove(&path) {
+                    self.rot.insert(to.clone(), r);
+                }
+                self.reload(Some(to));
+            }
+            Err(e) => self.status = format!("이름 바꾸기 실패: {e}"),
+        }
+    }
+
+    fn show_in_explorer(&self, p: &Path) {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("explorer")
+            .raw_arg(format!("/select,\"{}\"", p.display()))
+            .spawn();
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        self.fullscreen = !self.fullscreen;
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+    }
+
+    // ------------------------------------------------------------ tree
+
+    fn open_tree_to(&mut self, dir: &Path) {
+        for a in dir.ancestors().skip(1) {
+            let mut st = CollapsingState::load_with_default_open(&self.ctx, tree_id(a), false);
+            st.set_open(true);
+            st.store(&self.ctx);
+        }
+        self.tree_scroll_pending = true;
+    }
+
+    fn tree_ui(&mut self, ui: &mut Ui) {
+        let drives = self.drives.clone();
+        let mut nav = None;
+        for d in &drives {
+            self.tree_node(ui, d, d.display().to_string(), &mut nav);
+        }
+        if let Some(p) = nav {
+            self.navigate(p, true);
+        }
+    }
+
+    fn tree_node(&mut self, ui: &mut Ui, path: &Path, label: String, nav: &mut Option<PathBuf>) {
+        let state = CollapsingState::load_with_default_open(ui.ctx(), tree_id(path), false);
+        let selected = self.cur_dir == path;
+        let header = state.show_header(ui, |ui| {
+            let r = ui.selectable_label(selected, label);
+            if r.clicked() {
+                *nav = Some(path.to_path_buf());
+            }
+            if selected && self.tree_scroll_pending {
+                r.scroll_to_me(Some(Align::Center));
+                self.tree_scroll_pending = false;
+            }
+        });
+        header.body(|ui| {
+            let kids = self
+                .tree_children
+                .entry(path.to_path_buf())
+                .or_insert_with(|| list_subdirs(path))
+                .clone();
+            if kids.is_empty() {
+                ui.weak("(비어 있음)");
+            }
+            for k in kids {
+                let name = k.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                self.tree_node(ui, &k, name, nav);
+            }
+        });
+    }
+
+    // ------------------------------------------------------------ UI: browser
+
+    fn modal_open(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    fn grid_keys(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() || self.modal_open() {
+            return;
+        }
+        let (mods, back_btn, fwd_btn) = ctx.input(|i| {
+            (
+                i.modifiers,
+                i.pointer.button_pressed(egui::PointerButton::Extra1),
+                i.pointer.button_pressed(egui::PointerButton::Extra2),
+            )
+        });
+        let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
+        if back_btn || (mods.alt && pressed(Key::ArrowLeft)) {
+            self.go_back();
+            return;
+        }
+        if fwd_btn || (mods.alt && pressed(Key::ArrowRight)) {
+            self.go_fwd();
+            return;
+        }
+        if (mods.alt && pressed(Key::ArrowUp)) || pressed(Key::Backspace) {
+            self.go_up();
+            return;
+        }
+        if pressed(Key::F5) {
+            self.reload(None);
+            return;
+        }
+        let n = self.entries.len();
+        if n == 0 {
+            return;
+        }
+        let cols = self.cols.max(1) as isize;
+        let page = ((self.grid_view_h / (self.cell_size().y + GAP)).floor().max(1.0) as isize) * cols;
+        let mut delta: Option<isize> = None;
+        let mut target: Option<usize> = None;
+        if pressed(Key::ArrowRight) { delta = Some(1) }
+        if pressed(Key::ArrowLeft) { delta = Some(-1) }
+        if pressed(Key::ArrowDown) { delta = Some(cols) }
+        if pressed(Key::ArrowUp) { delta = Some(-cols) }
+        if pressed(Key::PageDown) { delta = Some(page) }
+        if pressed(Key::PageUp) { delta = Some(-page) }
+        if pressed(Key::Home) { target = Some(0) }
+        if pressed(Key::End) { target = Some(n - 1) }
+        if let Some(d) = delta {
+            target = Some(match self.focus {
+                None => 0,
+                Some(f) => (f as isize + d).clamp(0, n as isize - 1) as usize,
+            });
+        }
+        if let Some(t) = target {
+            self.move_focus(t, mods.shift);
+        }
+        if mods.command && pressed(Key::A) {
+            self.selected = (0..n).collect();
+        }
+        if pressed(Key::Enter) {
+            if let Some(f) = self.focus {
+                self.open_entry(f);
+            }
+        }
+        if pressed(Key::Delete) {
+            let p = self.selected_paths();
+            self.ask_delete(p);
+        }
+        if pressed(Key::F2) {
+            self.ask_rename();
+        }
+    }
+
+    fn toolbar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().button_padding = vec2(8.0, 5.0);
+            if ui.add_enabled(!self.back.is_empty(), egui::Button::new("◀")).on_hover_text("뒤로 (Alt+←)").clicked() {
+                self.go_back();
+            }
+            if ui.add_enabled(!self.fwd.is_empty(), egui::Button::new("▶")).on_hover_text("앞으로 (Alt+→)").clicked() {
+                self.go_fwd();
+            }
+            if ui.add_enabled(self.cur_dir.parent().is_some(), egui::Button::new("▲")).on_hover_text("위로 (Backspace)").clicked() {
+                self.go_up();
+            }
+            let mut go: Option<PathBuf> = None;
+            ui.menu_button("최근 ▼", |ui| {
+                for (k, p) in self.recent.iter().enumerate() {
+                    let here = *p == self.cur_dir;
+                    if ui.selectable_label(here, format!("{}  {}", k + 1, p.display())).clicked() {
+                        go = Some(p.clone());
+                        ui.close_menu();
+                    }
+                }
+                if self.recent.is_empty() {
+                    ui.weak("없음");
+                }
+            })
+            .response
+            .on_hover_text("최근에 연 폴더 10개");
+            if let Some(p) = go {
+                self.navigate(p, true);
+            }
+            if ui.button("새로고침").on_hover_text("F5").clicked() {
+                self.reload(None);
+            }
+            ui.separator();
+
+            let has_img = self.focus.and_then(|i| self.entries.get(i)).map(|e| !e.is_dir).unwrap_or(false);
+            let has_sel = !self.selected_paths().is_empty();
+            if ui.add_enabled(has_img, egui::Button::new("크게보기")).on_hover_text("Enter").clicked() {
+                if let Some(f) = self.focus {
+                    self.open_entry(f);
+                }
+            }
+            if ui.add_enabled(has_sel, egui::Button::new("-90° 회전")).clicked() {
+                self.rotate_current(-1);
+            }
+            if ui.add_enabled(has_sel, egui::Button::new("90° 회전")).clicked() {
+                self.rotate_current(1);
+            }
+            if ui.add_enabled(self.focus.is_some(), egui::Button::new("이름변경")).on_hover_text("F2").clicked() {
+                self.ask_rename();
+            }
+            if ui.add_enabled(has_sel, egui::Button::new("삭제")).on_hover_text("Delete (휴지통으로)").clicked() {
+                let p = self.selected_paths();
+                self.ask_delete(p);
+            }
+            if ui.button("탐색기").on_hover_text("탐색기에서 열기").clicked() {
+                let p = self.focus.and_then(|i| self.entries.get(i)).map(|e| e.path.clone());
+                match p {
+                    Some(p) => self.show_in_explorer(&p),
+                    None => {
+                        let _ = std::process::Command::new("explorer").arg(&self.cur_dir).spawn();
+                    }
+                }
+            }
+            ui.menu_button("더보기", |ui| {
+                if ui.button("썸네일 캐시 비우기").clicked() {
+                    self.status = match cache::clear() {
+                        Ok(()) => "썸네일 캐시를 비웠습니다".into(),
+                        Err(e) => format!("캐시 비우기 실패: {e}"),
+                    };
+                    ui.close_menu();
+                }
+                if ui.button("캐시 폴더 열기").clicked() {
+                    if let Some(d) = cache::dir() {
+                        let _ = std::process::Command::new("explorer").arg(d).spawn();
+                    }
+                    ui.close_menu();
+                }
+            });
+            ui.separator();
+
+            ui.label("정렬");
+            let before = (self.sort, self.sort_desc);
+            egui::ComboBox::from_id_salt("sort")
+                .width(60.0)
+                .selected_text(match self.sort {
+                    SortKey::Name => "이름",
+                    SortKey::Date => "날짜",
+                    SortKey::Size => "크기",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.sort, SortKey::Name, "이름");
+                    ui.selectable_value(&mut self.sort, SortKey::Date, "날짜");
+                    ui.selectable_value(&mut self.sort, SortKey::Size, "크기");
+                });
+            if ui.button(if self.sort_desc { "내림차순" } else { "오름차순" }).clicked() {
+                self.sort_desc = !self.sort_desc;
+            }
+            if before != (self.sort, self.sort_desc) {
+                self.sort_entries();
+            }
+            ui.separator();
+            ui.label("크기");
+            ui.add(egui::Slider::new(&mut self.thumb_size, 64.0..=256.0).show_value(false));
+        });
+    }
+
+    fn address_bar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label("주소");
+            let r = ui.add(egui::TextEdit::singleline(&mut self.addr_text).desired_width(f32::INFINITY));
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                self.open_address();
+            }
+        });
+    }
+
+    fn status_bar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            match self.focus_dims {
+                Some([w, h]) => ui.label(format!("{w} x {h}")),
+                None => ui.label("-"),
+            };
+            ui.separator();
+            let sel_size: u64 = self.selected.iter().filter_map(|&i| self.entries.get(i)).map(|e| e.size).sum();
+            ui.label(format!("{} 개체 선택 ({})", self.selected.len(), fmt_size(sel_size)));
+            ui.separator();
+            let imgs = self.entries.iter().filter(|e| !e.is_dir).count();
+            ui.label(format!("총 {} 개체 (그림 {imgs})", self.entries.len()));
+            if !self.status.is_empty() {
+                ui.separator();
+                ui.colored_label(Color32::from_rgb(180, 60, 20), &self.status);
+            }
+        });
+    }
+
+    fn quick_access(&mut self, ui: &mut Ui) {
+        let home = std::env::var("USERPROFILE").map(PathBuf::from).unwrap_or_default();
+        let items = [
+            ("바탕화면", home.join("Desktop")),
+            ("다운로드", home.join("Downloads")),
+            ("사진", home.join("Pictures")),
+            ("문서", home.join("Documents")),
+            ("홈", home.clone()),
+        ];
+        ui.horizontal_wrapped(|ui| {
+            for (label, p) in items {
+                if p.is_dir() && ui.small_button(label).clicked() {
+                    self.navigate(p, true);
+                }
+            }
+        });
+    }
+
+    fn grid(&mut self, ui: &mut Ui) {
+        let n = self.entries.len();
+        if n == 0 {
+            ui.centered_and_justified(|ui| ui.weak("그림이 없습니다"));
+            return;
+        }
+        let cell = self.cell_size();
+        let avail = ui.available_width();
+        let cols = (((avail + GAP) / (cell.x + GAP)).floor() as usize).max(1);
+        self.cols = cols;
+        let rows = n.div_ceil(cols);
+        ui.spacing_mut().item_spacing.y = GAP;
+        if self.grid_scroll_to.is_some() {
+            self.scroll_anim = None; // keyboard / navigation jumps win over the animation
+        }
+        self.wheel_rows(ui, rows);
+        if let Some((from, to, start)) = self.scroll_anim {
+            let t = (start.elapsed().as_secs_f32() / SCROLL_ANIM.as_secs_f32()).min(1.0);
+            let ease = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+            self.grid_scroll_to = Some(from + (to - from) * ease);
+            if t >= 1.0 {
+                self.scroll_anim = None;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+
+        let mut sa = egui::ScrollArea::vertical().auto_shrink(false).id_salt("grid");
+        if let Some(off) = self.grid_scroll_to.take() {
+            sa = sa.vertical_scroll_offset(off);
+        }
+        let out = sa.show_rows(ui, cell.y, rows, |ui, range| {
+            let s = range.start * cols;
+            let e = (range.end * cols).min(n);
+            self.vis_start.store(s, Ordering::Relaxed);
+            self.vis_end.store(e, Ordering::Relaxed);
+            for r in range.clone() {
+                let (row_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), cell.y), Sense::hover());
+                for c in 0..cols {
+                    let i = r * cols + c;
+                    if i >= n {
+                        break;
+                    }
+                    let rect = Rect::from_min_size(row_rect.min + vec2(c as f32 * (cell.x + GAP), 0.0), cell);
+                    self.cell(ui, i, rect);
+                }
+            }
+            // visible first, then two rows ahead
+            for i in s..((range.end + 2) * cols).min(n) {
+                self.request_thumb(i);
+            }
+        });
+        self.grid_offset = out.state.offset.y;
+        self.grid_view_h = out.inner_rect.height();
+    }
+
+    /// One wheel notch scrolls exactly one row of thumbnails.
+    fn wheel_rows(&mut self, ui: &mut Ui, rows: usize) {
+        if !ui.rect_contains_pointer(ui.max_rect()) {
+            return;
+        }
+        let pitch = self.cell_size().y + GAP;
+        let page_rows = (self.grid_view_h / pitch).floor().max(1.0);
+        let notches: f32 = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::MouseWheel { unit, delta, modifiers } if !modifiers.command => Some(match unit {
+                        egui::MouseWheelUnit::Line => delta.y,
+                        egui::MouseWheelUnit::Point => delta.y / 50.0, // touchpads
+                        egui::MouseWheelUnit::Page => delta.y * page_rows,
+                    }),
+                    _ => None,
+                })
+                .sum()
+        });
+        // keep the ScrollArea from also scrolling by pixels
+        ui.ctx().input_mut(|i| {
+            i.smooth_scroll_delta.y = 0.0;
+            i.raw_scroll_delta.y = 0.0;
+        });
+        if notches == 0.0 {
+            return;
+        }
+        self.wheel_acc += notches;
+        let steps = self.wheel_acc.trunc();
+        self.wheel_acc -= steps;
+        if steps == 0.0 {
+            return;
+        }
+        // chain from where the running animation is headed, not where it is now
+        let base = match self.scroll_anim {
+            Some((_, to, _)) => to,
+            None => self.grid_scroll_to.unwrap_or(self.grid_offset),
+        };
+        let row = (base / pitch).round() - steps; // wheel up (+) = earlier rows
+        let max = (rows as f32 * pitch - GAP - self.grid_view_h).max(0.0);
+        let to = (row * pitch).clamp(0.0, max);
+        self.grid_scroll_to = None;
+        self.scroll_anim = Some((self.grid_offset, to, Instant::now()));
+    }
+
+    fn cell(&mut self, ui: &mut Ui, i: usize, rect: Rect) {
+        let resp = ui.interact(rect, Id::new(("cell", i)), Sense::click());
+        let selected = self.selected.contains(&i);
+        let painter = ui.painter();
+        let bg = if selected {
+            Color32::from_rgb(204, 228, 255)
+        } else if resp.hovered() {
+            Color32::from_rgb(235, 244, 255)
+        } else {
+            Color32::WHITE
+        };
+        let border = if selected { Color32::from_rgb(100, 160, 230) } else { Color32::from_gray(215) };
+        painter.rect_filled(rect, 4.0f32, bg);
+        painter.rect_stroke(rect, 4.0f32, Stroke::new(1.0f32, border), egui::StrokeKind::Inside);
+
+        let ts = self.thumb_size;
+        let img_area = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(ts, ts));
+        let e = &self.entries[i];
+        if e.is_dir {
+            draw_folder(painter, img_area);
+        } else {
+            match &self.thumbs[i] {
+                Thumb::Ready(t) => {
+                    draw_image(ui, t, t.size_vec2(), img_area, self.rot_of(&e.path), None, Vec2::ZERO);
+                }
+                Thumb::Failed => {
+                    painter.text(img_area.center(), Align2::CENTER_CENTER, "읽을 수 없음", FontId::proportional(12.0), Color32::GRAY);
+                }
+                _ => {
+                    painter.rect_filled(img_area.shrink(ts * 0.3), 4.0, Color32::from_gray(238));
+                }
+            }
+        }
+
+        let mut job = LayoutJob::single_section(
+            e.name.clone(),
+            TextFormat { font_id: FontId::proportional(13.0), color: Color32::from_gray(30), ..Default::default() },
+        );
+        job.wrap.max_width = rect.width() - 8.0;
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        job.halign = Align::Center;
+        let galley = ui.fonts(|f| f.layout_job(job));
+        ui.painter().galley(pos2(rect.center().x, rect.max.y - 22.0), galley, Color32::BLACK);
+
+        let path = e.path.clone();
+        let is_dir = e.is_dir;
+        if resp.double_clicked() {
+            // opening a folder replaces `entries`; doing it mid-grid made the
+            // remaining cells index past the new, shorter list
+            self.pending_open = Some(i);
+        } else if resp.clicked() {
+            let mods = ui.input(|inp| inp.modifiers);
+            self.click_entry(i, mods);
+        } else if resp.secondary_clicked() && !selected {
+            self.select_single(i);
+        }
+        resp.context_menu(|ui| {
+            if ui.button(if is_dir { "열기" } else { "크게보기" }).clicked() {
+                self.pending_open = Some(i);
+                ui.close_menu();
+            }
+            if ui.button("이름 바꾸기 (F2)").clicked() {
+                self.select_single(i);
+                self.ask_rename();
+                ui.close_menu();
+            }
+            if !is_dir && ui.button("삭제 (휴지통)").clicked() {
+                let p = self.selected_paths();
+                self.ask_delete(p);
+                ui.close_menu();
+            }
+            if ui.button("탐색기에서 보기").clicked() {
+                self.show_in_explorer(&path);
+                ui.close_menu();
+            }
+            if ui.button("경로 복사").clicked() {
+                ui.ctx().copy_text(path.display().to_string());
+                ui.close_menu();
+            }
+        });
+    }
+
+    fn preview(&mut self, ui: &mut Ui) {
+        ui.label(egui::RichText::new("미리보기").strong());
+        ui.separator();
+        let Some(i) = self.focus else {
+            ui.weak("미리 볼 파일을 고르세요.");
+            return;
+        };
+        let Some(e) = self.entries.get(i) else { return };
+        if e.is_dir {
+            ui.label(&e.name);
+            ui.weak("폴더");
+            return;
+        }
+        let area_h = (ui.available_height() - 90.0).max(60.0);
+        let (area, resp) = ui.allocate_exact_size(vec2(ui.available_width(), area_h), Sense::click());
+        let rot = self.rot_of(&e.path);
+        match (self.big.get(&e.path), &self.thumbs[i]) {
+            (Some(Big::Ready(t, d)), _) => {
+                draw_image(ui, t, vec2(d[0] as f32, d[1] as f32), area, rot, None, Vec2::ZERO);
+            }
+            (Some(Big::Failed), _) => {
+                ui.painter().text(area.center(), Align2::CENTER_CENTER, "열 수 없는 그림", FontId::proportional(14.0), Color32::GRAY);
+            }
+            (_, Thumb::Ready(t)) => {
+                // thumbnail stands in until the full image arrives
+                let size = self.focus_dims.map(|d| vec2(d[0] as f32, d[1] as f32)).filter(|_| rot == 0).unwrap_or(t.size_vec2());
+                draw_image(ui, t, fit_aspect(size, t.size_vec2()), area, rot, None, Vec2::ZERO);
+            }
+            _ => {}
+        }
+        let open = resp.double_clicked();
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(&e.name).strong());
+        if let Some([w, h]) = self.focus_dims {
+            ui.label(format!("{w} x {h}"));
+        }
+        ui.label(fmt_size(e.size));
+        ui.label(fmt_time(e.modified));
+        if open {
+            self.open_entry(i);
+        }
+    }
+
+    fn browser_ui(&mut self, ctx: &egui::Context) {
+        self.grid_keys(ctx);
+
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.add_space(4.0);
+            self.toolbar(ui);
+            ui.add_space(2.0);
+            self.address_bar(ui);
+            ui.add_space(4.0);
+        });
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
+        egui::SidePanel::left("tree").resizable(true).default_width(250.0).show(ctx, |ui| {
+            self.quick_access(ui);
+            ui.separator();
+            egui::ScrollArea::both().auto_shrink(false).id_salt("tree_scroll").show(ui, |ui| self.tree_ui(ui));
+        });
+        egui::SidePanel::right("preview").resizable(true).default_width(320.0).show(ctx, |ui| self.preview(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(Color32::from_gray(246)).inner_margin(8.0))
+            .show(ctx, |ui| self.grid(ui));
+        if let Some(i) = self.pending_open.take() {
+            self.open_entry(i);
+        }
+
+        // load the full picture for the preview once the focus settles
+        if let Some(p) = self.focus.and_then(|i| self.entries.get(i)).filter(|e| !e.is_dir).map(|e| e.path.clone()) {
+            if !self.big.contains_key(&p) {
+                let el = self.focus_time.elapsed();
+                if el >= PREVIEW_DELAY {
+                    self.request_big(&p);
+                } else {
+                    ctx.request_repaint_after(PREVIEW_DELAY - el);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ UI: viewer
+
+    fn neighbor_image(&self, from: usize, dir: isize) -> Option<usize> {
+        let n = self.entries.len() as isize;
+        let mut i = from as isize + dir;
+        while i >= 0 && i < n {
+            if !self.entries[i as usize].is_dir {
+                return Some(i as usize);
+            }
+            i += dir;
+        }
+        None
+    }
+
+    fn close_viewer(&mut self) {
+        if let Some(v) = self.viewer.take() {
+            self.select_single(v.idx);
+        }
+        if self.fullscreen {
+            self.toggle_fullscreen();
+        }
+    }
+
+    fn viewer_ui(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.viewer.as_ref().map(|v| v.idx) else { return };
+        if idx >= self.entries.len() {
+            self.viewer = None;
+            return;
+        }
+
+        // keys
+        if !self.modal_open() {
+            let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
+            let mods = ctx.input(|i| i.modifiers);
+            let mut go: Option<usize> = None;
+            if pressed(Key::Escape) || pressed(Key::Enter) {
+                self.close_viewer();
+                return;
+            }
+            if pressed(Key::ArrowRight) || pressed(Key::ArrowDown) || pressed(Key::PageDown) || pressed(Key::Space) {
+                go = self.neighbor_image(idx, 1);
+            }
+            if pressed(Key::ArrowLeft) || pressed(Key::ArrowUp) || pressed(Key::PageUp) || pressed(Key::Backspace) {
+                go = self.neighbor_image(idx, -1);
+            }
+            if pressed(Key::Home) {
+                go = (0..self.entries.len()).find(|&i| !self.entries[i].is_dir);
+            }
+            if pressed(Key::End) {
+                go = (0..self.entries.len()).rev().find(|&i| !self.entries[i].is_dir);
+            }
+            if pressed(Key::R) {
+                self.rotate_current(if mods.shift { -1 } else { 1 });
+            }
+            if pressed(Key::L) {
+                self.rotate_current(-1);
+            }
+            if pressed(Key::F11) || pressed(Key::F) {
+                self.toggle_fullscreen();
+            }
+            if pressed(Key::Delete) {
+                let p = self.entries[idx].path.clone();
+                self.ask_delete(vec![p]);
+            }
+            if pressed(Key::Num0) || pressed(Key::Num8) {
+                if let Some(v) = &mut self.viewer {
+                    v.zoom = None;
+                    v.pan = Vec2::ZERO;
+                }
+            }
+            if pressed(Key::Num1) {
+                if let Some(v) = &mut self.viewer {
+                    v.zoom = Some(1.0);
+                    v.pan = Vec2::ZERO;
+                }
+            }
+            if let Some(g) = go {
+                self.viewer = Some(Viewer { idx: g, zoom: None, pan: Vec2::ZERO });
+                self.select_single(g);
+            }
+        }
+        let Some(idx) = self.viewer.as_ref().map(|v| v.idx) else { return };
+
+        // current + neighbours
+        let cur = self.entries[idx].path.clone();
+        for d in [1isize, -1] {
+            if let Some(j) = self.neighbor_image(idx, d) {
+                let p = self.entries[j].path.clone();
+                self.request_big(&p);
+            }
+        }
+        self.request_big(&cur);
+
+        let total = self.entries.iter().filter(|e| !e.is_dir).count();
+        let pos = self.entries[..=idx].iter().filter(|e| !e.is_dir).count();
+        let rot = self.rot_of(&cur);
+        let name = self.entries[idx].name.clone();
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(Color32::from_gray(18)))
+            .show(ctx, |ui| {
+                let area = ui.max_rect();
+                let resp = ui.interact(area, Id::new("viewer_area"), Sense::click_and_drag());
+                let (zoom_delta, scroll_y, hover) =
+                    ctx.input(|i| (i.zoom_delta(), i.raw_scroll_delta.y, i.pointer.hover_pos()));
+                let mut info = String::new();
+                let mut nav: Option<isize> = None;
+
+                match self.big.get(&cur) {
+                    Some(Big::Ready(t, d)) => {
+                        let img = vec2(d[0] as f32, d[1] as f32);
+                        let rimg = if rot % 2 == 1 { vec2(img.y, img.x) } else { img };
+                        let v = self.viewer.as_mut().unwrap();
+                        let fit = fit_scale(rimg, area.size());
+                        let mut scale = v.zoom.unwrap_or(fit);
+                        if zoom_delta != 1.0 {
+                            let new = (scale * zoom_delta).clamp(0.02, 40.0);
+                            if let Some(h) = hover {
+                                let c = area.center() + v.pan;
+                                let off = h - c;
+                                v.pan += off - off * (new / scale);
+                            }
+                            scale = new;
+                            v.zoom = Some(new);
+                        } else if scroll_y != 0.0 {
+                            nav = Some(if scroll_y < 0.0 { 1 } else { -1 });
+                        }
+                        let kz = ctx.input(|i| (i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals), i.key_pressed(Key::Minus)));
+                        if kz.0 || kz.1 {
+                            scale = (scale * if kz.0 { 1.25 } else { 0.8 }).clamp(0.02, 40.0);
+                            v.zoom = Some(scale);
+                        }
+                        if resp.dragged() {
+                            v.pan += resp.drag_delta();
+                        }
+                        let pan = v.pan;
+                        draw_image(ui, t, img, area, rot, Some(scale), pan);
+                        info = format!("{name}   ({pos}/{total})   {} x {}   {:.0}%", d[0], d[1], scale * 100.0);
+                    }
+                    Some(Big::Failed) => {
+                        ui.painter().text(area.center(), Align2::CENTER_CENTER, "열 수 없는 그림", FontId::proportional(20.0), Color32::LIGHT_GRAY);
+                        if scroll_y != 0.0 {
+                            nav = Some(if scroll_y < 0.0 { 1 } else { -1 });
+                        }
+                    }
+                    _ => {
+                        if let Thumb::Ready(t) = &self.thumbs[idx] {
+                            let s = t.size_vec2();
+                            let big = s * (area.width() / s.x).min(area.height() / s.y) * 0.9;
+                            draw_image(ui, t, big, area, rot, None, Vec2::ZERO);
+                        }
+                        info = format!("{name}   ({pos}/{total})   불러오는 중…");
+                    }
+                }
+                if !info.is_empty() {
+                    let p = ui.painter();
+                    let r = p.text(area.min + vec2(12.0, 10.0), Align2::LEFT_TOP, &info, FontId::proportional(14.0), Color32::TRANSPARENT);
+                    p.rect_filled(r.expand(6.0), 4.0, Color32::from_black_alpha(150));
+                    p.text(area.min + vec2(12.0, 10.0), Align2::LEFT_TOP, &info, FontId::proportional(14.0), Color32::WHITE);
+                }
+                if resp.double_clicked() {
+                    self.close_viewer();
+                    return;
+                }
+                if let Some(d) = nav {
+                    if let Some(g) = self.neighbor_image(idx, d) {
+                        self.viewer = Some(Viewer { idx: g, zoom: None, pan: Vec2::ZERO });
+                        self.select_single(g);
+                    }
+                }
+            });
+    }
+
+    // ------------------------------------------------------------ dialogs
+
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.dialog.take() else { return };
+        let enter = ctx.input(|i| i.key_pressed(Key::Enter));
+        let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+        match dialog {
+            Dialog::Delete(paths) => {
+                let mut result: Option<bool> = None;
+                egui::Window::new("삭제")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        if paths.len() == 1 {
+                            let n = paths[0].file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                            ui.label(format!("'{n}' 파일을 휴지통으로 보낼까요?"));
+                        } else {
+                            ui.label(format!("{}개 파일을 휴지통으로 보낼까요?", paths.len()));
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("예 (Enter)").clicked() {
+                                result = Some(true);
+                            }
+                            if ui.button("아니오 (Esc)").clicked() {
+                                result = Some(false);
+                            }
+                        });
+                    });
+                if enter {
+                    result = Some(true);
+                }
+                if esc {
+                    result = Some(false);
+                }
+                match result {
+                    Some(true) => self.do_delete(paths),
+                    Some(false) => {}
+                    None => self.dialog = Some(Dialog::Delete(paths)),
+                }
+            }
+            Dialog::Rename { path, mut text, first } => {
+                let mut result: Option<bool> = None;
+                egui::Window::new("이름 바꾸기")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(320.0));
+                        if first {
+                            r.request_focus();
+                        }
+                        if r.lost_focus() && enter {
+                            result = Some(true);
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("확인").clicked() {
+                                result = Some(true);
+                            }
+                            if ui.button("취소").clicked() {
+                                result = Some(false);
+                            }
+                        });
+                    });
+                if esc {
+                    result = Some(false);
+                }
+                match result {
+                    Some(true) => self.do_rename(path, &text),
+                    Some(false) => {}
+                    None => self.dialog = Some(Dialog::Rename { path, text, first: false }),
+                }
+            }
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let s = Settings {
+            last_dir: Some(self.cur_dir.clone()).filter(|d| !d.as_os_str().is_empty()),
+            recent: self.recent.clone(),
+            sort: self.sort,
+            sort_desc: self.sort_desc,
+            thumb_size: self.thumb_size,
+        };
+        eframe::set_value(storage, eframe::APP_KEY, &s);
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_msgs();
+        if self.viewer.is_some() {
+            self.viewer_ui(ctx);
+        } else {
+            self.browser_ui(ctx);
+        }
+        self.dialogs(ctx);
+        self.evict_thumbs();
+    }
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn tex_opts() -> TextureOptions {
+    TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR }
+}
+
+fn tree_id(p: &Path) -> Id {
+    Id::new(("tree", p))
+}
+
+/// Scale that fits `r` into `a`, never enlarging.
+fn fit_scale(r: Vec2, a: Vec2) -> f32 {
+    (a.x / r.x).min(a.y / r.y).min(1.0)
+}
+
+/// Size with the aspect ratio of `tex` but the magnitude of `target`.
+fn fit_aspect(target: Vec2, tex: Vec2) -> Vec2 {
+    let k = (target.x / tex.x).max(target.y / tex.y);
+    tex * k
+}
+
+/// Draw `tex` (logical size `img`) inside `area`, rotated by `rot` quarter turns.
+fn draw_image(ui: &Ui, tex: &TextureHandle, img: Vec2, area: Rect, rot: i32, scale: Option<f32>, pan: Vec2) {
+    let q = rot.rem_euclid(4);
+    let rimg = if q % 2 == 1 { vec2(img.y, img.x) } else { img };
+    let s = scale.unwrap_or_else(|| fit_scale(rimg, area.size()));
+    let rect = Rect::from_center_size(area.center() + pan, img * s);
+    egui::Image::from_texture(SizedTexture::new(tex.id(), img))
+        .rotate(q as f32 * std::f32::consts::FRAC_PI_2, Vec2::splat(0.5))
+        .paint_at(ui, rect);
+}
+
+fn draw_folder(p: &egui::Painter, area: Rect) {
+    let w = area.width() * 0.62;
+    let h = w * 0.72;
+    let body = Rect::from_center_size(area.center() + vec2(0.0, w * 0.05), vec2(w, h));
+    let tab = Rect::from_min_size(body.min - vec2(0.0, h * 0.12), vec2(w * 0.42, h * 0.25));
+    p.rect_filled(tab, 3.0, Color32::from_rgb(232, 178, 50));
+    p.rect_filled(body, 4.0, Color32::from_rgb(250, 204, 80));
+    let front = Rect::from_min_max(body.min + vec2(0.0, h * 0.18), body.max);
+    p.rect_filled(front, 4.0, Color32::from_rgb(255, 218, 110));
+}
+
+fn setup_fonts(ctx: &egui::Context) {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+    let Ok(bytes) = std::fs::read(Path::new(&windir).join("Fonts").join("malgun.ttf")) else { return };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("malgun".into(), Arc::new(egui::FontData::from_owned(bytes)));
+    if let Some(f) = fonts.families.get_mut(&FontFamily::Proportional) {
+        f.insert(0, "malgun".into());
+    }
+    if let Some(f) = fonts.families.get_mut(&FontFamily::Monospace) {
+        f.push("malgun".into());
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn normalize(p: PathBuf) -> PathBuf {
+    match std::fs::canonicalize(&p) {
+        Ok(c) => {
+            let s = c.to_string_lossy();
+            match s.strip_prefix(r"\\?\") {
+                Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest.to_string()),
+                _ => c,
+            }
+        }
+        Err(_) => p,
+    }
+}
+
+fn is_hidden(md: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    md.file_attributes() & (0x2 | 0x4) != 0 // HIDDEN | SYSTEM
+}
+
+fn list_dir(dir: &Path) -> std::io::Result<Vec<Entry>> {
+    let mut v = Vec::new();
+    for de in std::fs::read_dir(dir)?.flatten() {
+        let Ok(md) = de.metadata() else { continue };
+        if is_hidden(&md) || de.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = de.path();
+        let is_dir = md.is_dir();
+        if !is_dir && !loader::is_image(&path) {
+            continue;
+        }
+        v.push(Entry {
+            name: de.file_name().to_string_lossy().into_owned(),
+            path,
+            is_dir,
+            size: if is_dir { 0 } else { md.len() },
+            modified: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        });
+    }
+    Ok(v)
+}
+
+fn list_subdirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut v: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|de| !de.file_name().to_string_lossy().starts_with('.'))
+        .filter(|de| de.metadata().map(|m| m.is_dir() && !is_hidden(&m)).unwrap_or(false))
+        .map(|de| de.path())
+        .collect();
+    v.sort_by(|a, b| {
+        natural_cmp(
+            &a.file_name().unwrap_or_default().to_string_lossy(),
+            &b.file_name().unwrap_or_default().to_string_lossy(),
+        )
+    });
+    v
+}
+
+fn natural_cmp(a: &str, b: &str) -> CmpOrd {
+    let (mut ai, mut bi) = (a.chars().peekable(), b.chars().peekable());
+    loop {
+        match (ai.peek().copied(), bi.peek().copied()) {
+            (None, None) => return CmpOrd::Equal,
+            (None, _) => return CmpOrd::Less,
+            (_, None) => return CmpOrd::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let mut na = String::new();
+                while let Some(c) = ai.peek().copied().filter(|c| c.is_ascii_digit()) {
+                    na.push(c);
+                    ai.next();
+                }
+                let mut nb = String::new();
+                while let Some(c) = bi.peek().copied().filter(|c| c.is_ascii_digit()) {
+                    nb.push(c);
+                    bi.next();
+                }
+                let (ta, tb) = (na.trim_start_matches('0'), nb.trim_start_matches('0'));
+                let o = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
+                if o != CmpOrd::Equal {
+                    return o;
+                }
+            }
+            (Some(x), Some(y)) => {
+                let o = Iterator::cmp(x.to_lowercase(), y.to_lowercase());
+                if o != CmpOrd::Equal {
+                    return o;
+                }
+                ai.next();
+                bi.next();
+            }
+        }
+    }
+}
+
+fn fmt_size(b: u64) -> String {
+    let b = b as f64;
+    if b < 1024.0 * 1024.0 {
+        format!("{:.2}KB", b / 1024.0)
+    } else if b < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.2}MB", b / 1024.0 / 1024.0)
+    } else {
+        format!("{:.2}GB", b / 1024.0 / 1024.0 / 1024.0)
+    }
+}
+
+fn fmt_time(t: SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn main() -> eframe::Result {
+    let start = std::env::args_os().nth(1).map(PathBuf::from);
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1400.0, 900.0])
+            .with_min_inner_size([640.0, 400.0])
+            .with_title("그림 뷰어"),
+        ..Default::default()
+    };
+    eframe::run_native("picview", options, Box::new(move |cc| Ok(Box::new(App::new(cc, start)))))
+}

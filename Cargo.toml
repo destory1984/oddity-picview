@@ -1,0 +1,24 @@
+[package]
+name = "picview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.31", features = ["persistence"] }
+serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp", "tiff", "ico", "rayon"] }
+jpeg-decoder = "0.3"
+kamadak-exif = "0.6"
+rayon = "1"
+trash = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+
+# decode images fast even in debug builds
+[profile.dev.package."*"]
+opt-level = 3
