@@ -2164,79 +2164,130 @@ impl App {
         self.measure_cache();
     }
 
+    /// Settings window. Layout and colours from a GPT (Codex) proposal; the
+    /// style changes stay inside this window.
     fn settings_window(&mut self, ctx: &egui::Context) {
-        if !self.show_settings {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new("설정")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.set_min_width(360.0);
-                ui.label(egui::RichText::new("썸네일 캐시").strong());
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("최대 크기");
-                    ui.spacing_mut().slider_width = 200.0;
-                    ui.add(egui::Slider::new(&mut self.cache_max_mb, CACHE_MIN_MB..=CACHE_MAX_MB).show_value(false));
-                    // click and type a number, or drag it
-                    ui.add(
-                        egui::DragValue::new(&mut self.cache_max_mb)
-                            .range(CACHE_MIN_MB..=CACHE_MAX_MB)
-                            .speed(5)
-                            .suffix(" MB"),
-                    )
-                    .on_hover_text("눌러서 숫자를 직접 넣거나, 좌우로 끌어 바꿉니다");
-                });
-                ui.horizontal(|ui| {
-                    for (label, mb) in [("100MB", 100), ("300MB", 300), ("500MB", 500), ("1GB", 1024)] {
-                        if ui.small_button(label).clicked() {
-                            self.cache_max_mb = mb;
-                        }
-                    }
-                });
-                ui.weak(format!(
-                    "{} 를 넘으면 프로그램을 켤 때 오래 안 본 썸네일부터 지워 {} 로 줄입니다.",
-                    fmt_size(self.cache_max_mb * 1024 * 1024),
-                    fmt_size(self.cache_max_mb * 1024 * 1024 / 10 * 8),
-                ));
-                let used = self.cache_usage.load(Ordering::Relaxed);
-                ui.label(if used == u64::MAX { "지금 쓰는 양: 재는 중…".to_string() } else { format!("지금 쓰는 양: {}", fmt_size(used)) });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("지금 줄이기").on_hover_text("최대 크기를 넘었으면 지금 바로 줄입니다").clicked() {
-                        let (limit, usage, c) = (self.cache_max_mb * 1024 * 1024, self.cache_usage.clone(), self.ctx.clone());
-                        usage.store(u64::MAX, Ordering::Relaxed);
-                        std::thread::spawn(move || {
-                            cache::trim(limit);
-                            usage.store(cache::usage(), Ordering::Relaxed);
-                            c.request_repaint();
-                        });
-                    }
-                    if ui.button("모두 비우기").clicked() {
-                        self.status = match cache::clear() {
-                            Ok(()) => "썸네일 캐시를 비웠습니다".into(),
-                            Err(e) => format!("캐시 비우기 실패: {e}"),
-                        };
-                        self.cache_usage.store(u64::MAX, Ordering::Relaxed);
-                        self.measure_cache();
-                    }
-                    if ui.button("폴더 열기").clicked() {
-                        if let Some(d) = cache::dir() {
-                            let _ = std::process::Command::new("explorer").arg(d).spawn();
-                        }
-                    }
-                });
-                if let Some(d) = cache::dir() {
-                    ui.weak(d.display().to_string());
-                }
+        use egui::{Color32 as C, CornerRadius, Frame, RichText, Stroke, vec2};
+        use std::sync::atomic::Ordering;
+        if !self.show_settings { return; }
+        let text = C::from_rgb(36, 48, 60);
+        let muted = C::from_rgb(111, 124, 140);
+        let line = C::from_rgb(230, 234, 240);
+        let hover = C::from_rgb(229, 241, 255);
+        let blue = C::from_rgb(57, 127, 197);
+        let frame = Frame::new().fill(C::WHITE)
+            .stroke(Stroke::new(1.0f32, C::from_rgb(213, 218, 225)))
+            .corner_radius(CornerRadius::same(8)).inner_margin(16)
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 4], blur: 12, spread: 0, color: C::from_black_alpha(32),
             });
-        if !open {
-            self.show_settings = false;
-        }
+        let mut open = true;
+        egui::Window::new(RichText::new("설정").size(18.0).color(text))
+            .open(&mut open).collapsible(false).resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(420.0).frame(frame).show(ctx, |ui| {
+                ui.set_width(420.0);
+                for t in [egui::TextStyle::Body, egui::TextStyle::Button, egui::TextStyle::Monospace] {
+                    ui.style_mut().text_styles.insert(t, egui::FontId::proportional(13.0));
+                }
+                let sp = ui.spacing_mut();
+                sp.item_spacing = vec2(8.0, 8.0);
+                sp.button_padding = vec2(10.0, 5.0);
+                sp.interact_size.y = 30.0;
+                sp.slider_width = 288.0;
+                let v = ui.visuals_mut();
+                v.override_text_color = Some(text);
+                v.extreme_bg_color = line;
+                v.selection.bg_fill = hover;
+                v.selection.stroke = Stroke::new(1.0f32, blue);
+                v.widgets.noninteractive.bg_stroke = Stroke::new(1.0f32, line);
+                for w in [&mut v.widgets.inactive, &mut v.widgets.hovered,
+                          &mut v.widgets.active, &mut v.widgets.open] {
+                    w.corner_radius = CornerRadius::same(4);
+                    w.bg_stroke = Stroke::new(1.0f32, line);
+                    w.fg_stroke = Stroke::new(1.0f32, text);
+                    w.expansion = 0.0;
+                }
+                v.widgets.inactive.weak_bg_fill = C::WHITE;
+                v.widgets.hovered.weak_bg_fill = hover;
+                v.widgets.active.weak_bg_fill = C::from_rgb(212, 231, 252);
+                v.widgets.open.weak_bg_fill = hover;
+                Frame::new().fill(C::from_rgb(248, 250, 252))
+                    .stroke(Stroke::new(1.0f32, line)).corner_radius(CornerRadius::same(6))
+                    .inner_margin(14).show(ui, |ui| {
+                        ui.set_width(390.0);
+                        ui.horizontal(|ui| {
+                            ui.image((self.icons.settings.id(), vec2(16.0, 16.0)));
+                            ui.label(RichText::new("썸네일 캐시").size(15.0).strong());
+                        });
+                        ui.separator();
+                        ui.label("최대 크기");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Slider::new(&mut self.cache_max_mb,
+                                CACHE_MIN_MB..=CACHE_MAX_MB).show_value(false));
+                            ui.scope(|ui| {
+                                ui.spacing_mut().interact_size.x = 94.0;
+                                ui.add(egui::DragValue::new(&mut self.cache_max_mb)
+                                    .range(CACHE_MIN_MB..=CACHE_MAX_MB).speed(5).suffix(" MB"))
+                                    .on_hover_text("클릭하여 직접 입력하거나 좌우로 끌어 바꿉니다");
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            for (label, mb) in [("100MB", 100), ("300MB", 300), ("500MB", 500), ("1GB", 1024)] {
+                                let b = egui::Button::new(label).selected(self.cache_max_mb == mb);
+                                if ui.add_sized([76.0, 30.0], b).clicked() { self.cache_max_mb = mb; }
+                            }
+                        });
+                        ui.add(egui::Label::new(RichText::new(
+                            "한도를 넘으면 다음 실행 때 오래된 항목부터 80%로 줄입니다."
+                        ).size(12.0).color(muted)).wrap());
+                        let limit = self.cache_max_mb * 1024 * 1024;
+                        let used = self.cache_usage.load(Ordering::Relaxed);
+                        let busy = used == u64::MAX;
+                        let ratio = if busy { 0.0 } else { used as f32 / limit as f32 };
+                        let color = if !busy && used > limit { C::from_rgb(181, 71, 53) } else { blue };
+                        ui.label(RichText::new(if busy { "사용량 확인 중…".into() } else {
+                            format!("사용 중: {} / {}  ({:.0}%){}", fmt_size(used),
+                                fmt_size(limit), ratio * 100.0, if used > limit { " · 한도 초과" } else { "" })
+                        }).color(if busy { muted } else { color }));
+                        ui.add(egui::ProgressBar::new(ratio).desired_width(390.0).desired_height(8.0)
+                            .fill(if busy || used == 0 { C::TRANSPARENT } else { color }));
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!busy, egui::Button::new("지금 줄이기"))
+                                .on_hover_text("한도를 넘었을 때만 80%로 줄입니다").clicked() {
+                                let (usage, c) = (self.cache_usage.clone(), self.ctx.clone());
+                                usage.store(u64::MAX, Ordering::Relaxed);
+                                std::thread::spawn(move || {
+                                    cache::trim(limit);
+                                    usage.store(cache::usage(), Ordering::Relaxed);
+                                    c.request_repaint();
+                                });
+                            }
+                            let clear = egui::Button::new(RichText::new("모두 비우기")
+                                .color(C::from_rgb(169, 50, 38))).fill(C::from_rgb(255, 242, 240))
+                                .stroke(Stroke::new(1.0f32, C::from_rgb(233, 184, 177)));
+                            if ui.add_enabled(!busy, clear).clicked() {
+                                self.status = match cache::clear() {
+                                    Ok(()) => "썸네일 캐시를 비웠습니다".into(),
+                                    Err(e) => format!("캐시 삭제 실패: {e}"),
+                                };
+                                self.cache_usage.store(u64::MAX, Ordering::Relaxed);
+                                self.measure_cache();
+                            }
+                            let image = egui::Image::new((self.icons.folder.id(), vec2(16.0, 16.0)));
+                            if ui.add(egui::Button::image_and_text(image, "폴더 열기")).clicked() {
+                                if let Some(d) = cache::dir() {
+                                    let _ = std::process::Command::new("explorer").arg(d).spawn();
+                                }
+                            }
+                        });
+                        if let Some(d) = cache::dir() {
+                            ui.add(egui::Label::new(RichText::new(d.display().to_string())
+                                .size(12.0).color(muted)).wrap());
+                        }
+                    });
+            });
+        self.show_settings = open;
     }
 
     // ------------------------------------------------------------ dialogs
@@ -2377,6 +2428,11 @@ impl eframe::App for App {
             self.viewer_ui(ctx);
         } else {
             self.browser_ui(ctx);
+        }
+        // PICVIEW_SHOW_SETTINGS=1 opens the settings window once at start (for screenshots)
+        static SETTINGS_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var_os("PICVIEW_SHOW_SETTINGS").is_some() && !SETTINGS_SHOWN.swap(true, Ordering::Relaxed) {
+            self.open_settings();
         }
         self.dialogs(ctx);
         self.settings_window(ctx);
