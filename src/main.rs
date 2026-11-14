@@ -98,6 +98,10 @@ struct DragFiles(Vec<PathBuf>);
 
 const TRANSFER_MAX: usize = 10;
 
+/// Range of the thumbnail cache limit in the settings window, in MB.
+const CACHE_MIN_MB: u64 = 100;
+const CACHE_MAX_MB: u64 = 1024;
+
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 enum SortKey {
     Name,
@@ -239,7 +243,7 @@ impl App {
             .collect();
 
         let saved: Settings = cc.storage.and_then(|st| eframe::get_value(st, eframe::APP_KEY)).unwrap_or_default();
-        let limit = saved.cache_max_mb.clamp(100, 102_400) * 1024 * 1024;
+        let limit = saved.cache_max_mb.clamp(CACHE_MIN_MB, CACHE_MAX_MB) * 1024 * 1024;
         std::thread::spawn(move || cache::trim(limit));
         let mut app = App {
             ctx: cc.egui_ctx.clone(),
@@ -290,7 +294,7 @@ impl App {
             icons: Arc::new(icons::Icons::new(&cc.egui_ctx)),
             transfer_dirs: saved.transfer_dirs.iter().filter(|p| p.is_dir()).take(TRANSFER_MAX).cloned().collect(),
             dnd_target: None,
-            cache_max_mb: saved.cache_max_mb.clamp(100, 102_400),
+            cache_max_mb: saved.cache_max_mb.clamp(CACHE_MIN_MB, CACHE_MAX_MB),
             show_settings: false,
             cache_usage: Arc::new(AtomicU64::new(u64::MAX)),
             recent: saved.recent.into_iter().filter(|p| p.is_dir()).take(RECENT_MAX).collect(),
@@ -2159,13 +2163,19 @@ impl App {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("최대 크기");
+                    ui.spacing_mut().slider_width = 200.0;
+                    ui.add(egui::Slider::new(&mut self.cache_max_mb, CACHE_MIN_MB..=CACHE_MAX_MB).show_value(false));
+                    // click and type a number, or drag it
                     ui.add(
                         egui::DragValue::new(&mut self.cache_max_mb)
-                            .range(100..=102_400)
-                            .speed(10)
+                            .range(CACHE_MIN_MB..=CACHE_MAX_MB)
+                            .speed(5)
                             .suffix(" MB"),
-                    );
-                    for (label, mb) in [("500MB", 500), ("1GB", 1024), ("5GB", 5120)] {
+                    )
+                    .on_hover_text("눌러서 숫자를 직접 넣거나, 좌우로 끌어 바꿉니다");
+                });
+                ui.horizontal(|ui| {
+                    for (label, mb) in [("100MB", 100), ("300MB", 300), ("500MB", 500), ("1GB", 1024)] {
                         if ui.small_button(label).clicked() {
                             self.cache_max_mb = mb;
                         }
