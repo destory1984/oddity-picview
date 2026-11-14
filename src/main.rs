@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// Folder name for settings (%APPDATA%) and the thumbnail cache (%LOCALAPPDATA%).
 pub const APP_ID: &str = "oddity-picview";
+const AUTHOR: &str = "destory1984";
+const REPO_URL: &str = "https://github.com/destory1984/oddity-picview";
 
 const GAP: f32 = 8.0;
 const MAX_THUMBS_LOADED: usize = 800;
@@ -2285,6 +2287,32 @@ impl App {
                             ui.add(egui::Label::new(RichText::new(d.display().to_string())
                                 .size(12.0).color(muted)).wrap());
                         }
+                    });
+                // about: name, version, author, GitHub
+                Frame::new().fill(C::from_rgb(248, 250, 252))
+                    .stroke(Stroke::new(1.0f32, line)).corner_radius(CornerRadius::same(6))
+                    .inner_margin(14).show(ui, |ui| {
+                        ui.set_width(390.0);
+                        ui.horizontal(|ui| {
+                            ui.image((self.icons.view.id(), vec2(16.0, 16.0)));
+                            ui.label(RichText::new("프로그램 정보").size(15.0).strong());
+                        });
+                        ui.separator();
+                        egui::Grid::new("about_grid").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+                            ui.label(RichText::new("이름").color(muted));
+                            ui.label(RichText::new("Oddity PicView").strong());
+                            ui.end_row();
+                            ui.label(RichText::new("버전").color(muted));
+                            ui.label(env!("CARGO_PKG_VERSION"));
+                            ui.end_row();
+                            ui.label(RichText::new("만든 사람").color(muted));
+                            ui.label(AUTHOR);
+                            ui.end_row();
+                            ui.label(RichText::new("GitHub").color(muted));
+                            ui.hyperlink_to(REPO_URL.trim_start_matches("https://"), REPO_URL)
+                                .on_hover_text("브라우저로 엽니다");
+                            ui.end_row();
+                        });
                     });
             });
         self.show_settings = open;
