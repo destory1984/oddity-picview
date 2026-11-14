@@ -76,3 +76,65 @@ pub fn tool_button(ui: &mut Ui, icon: &TextureHandle, label: &str, enabled: bool
     p.text(rect.center_bottom() - vec2(0.0, 9.0 - push), Align2::CENTER_CENTER, label, font, color);
     resp
 }
+
+// ---------------------------------------------------------------- popup menus
+// Design values from a GPT (Codex) proposal, applied only inside menus so the
+// rest of the UI keeps the default look.
+
+const MENU_TEXT: Color32 = Color32::from_rgb(36, 48, 60);
+const MENU_HOVER: Color32 = Color32::from_rgb(229, 241, 255);
+const MENU_PRESS: Color32 = Color32::from_rgb(212, 231, 252);
+const MENU_KEY: Color32 = Color32::from_rgb(111, 124, 140);
+const MENU_LINE: Color32 = Color32::from_rgb(230, 234, 240);
+
+/// Frame look shared by every popup: white, 8px corners, soft shadow.
+pub fn apply_menu_frame(ctx: &egui::Context) {
+    ctx.style_mut(|s| {
+        s.visuals.menu_corner_radius = egui::CornerRadius::same(8);
+        s.visuals.window_stroke = egui::Stroke::new(1.0f32, Color32::from_rgb(213, 218, 225));
+        s.visuals.popup_shadow = egui::epaint::Shadow { offset: [0, 4], blur: 12, spread: 0, color: Color32::from_black_alpha(32) };
+        s.spacing.menu_margin = egui::Margin::same(6);
+    });
+}
+
+/// Call at the top of a menu: flat 30px items with a light-blue hover.
+pub fn style_menu(ui: &mut Ui, min_width: f32) {
+    ui.set_min_width(min_width);
+    let sp = ui.spacing_mut();
+    sp.button_padding = vec2(10.0, 5.0);
+    sp.item_spacing.y = 2.0;
+    sp.icon_spacing = 8.0;
+    let v = ui.visuals_mut();
+    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+        w.corner_radius = egui::CornerRadius::same(4);
+        w.bg_stroke = egui::Stroke::NONE;
+        w.fg_stroke = egui::Stroke::new(1.0f32, MENU_TEXT);
+        w.expansion = 0.0;
+    }
+    v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    v.widgets.hovered.weak_bg_fill = MENU_HOVER;
+    v.widgets.open.weak_bg_fill = MENU_HOVER;
+    v.widgets.active.weak_bg_fill = MENU_PRESS;
+    v.selection.bg_fill = MENU_HOVER;
+    v.selection.stroke = egui::Stroke::new(1.0f32, MENU_TEXT);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0f32, MENU_LINE);
+}
+
+/// Menu row: 16px icon column (kept empty when there is no icon), label,
+/// shortcut on the right.
+pub fn menu_item(ui: &mut Ui, icon: Option<&TextureHandle>, text: impl Into<egui::WidgetText>, shortcut: &str, enabled: bool) -> Response {
+    let size = vec2(16.0, 16.0);
+    let image = match icon {
+        Some(t) => egui::Image::new((t.id(), size)),
+        // the font atlas, fully transparent: reserves the icon column
+        None => egui::Image::new((egui::TextureId::Managed(0), size)).tint(Color32::TRANSPARENT),
+    };
+    let button = egui::Button::image_and_text(image.fit_to_exact_size(size), text)
+        .shortcut_text(egui::RichText::new(shortcut).size(12.0).color(MENU_KEY))
+        .min_size(vec2(ui.available_width(), 30.0));
+    ui.add_enabled(enabled, button)
+}
+
+pub fn menu_sep(ui: &mut Ui) {
+    ui.add(egui::Separator::default().spacing(8.0));
+}

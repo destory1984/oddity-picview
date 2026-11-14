@@ -235,6 +235,7 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, start: Option<PathBuf>) -> Self {
         setup_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(egui::Visuals::light());
+        icons::apply_menu_frame(&cc.egui_ctx);
         let (tx, rx) = mpsc::channel();
 
         let drives = ('A'..='Z')
@@ -1029,18 +1030,19 @@ impl App {
 
     /// Submenu listing the last folders files went to, plus a folder picker.
     fn dest_menu(&mut self, ui: &mut Ui, files: &[PathBuf], mv: bool) {
-        ui.set_min_width(280.0);
+        icons::style_menu(ui, 280.0);
+        let ic = self.icons.clone();
         let mut act: Option<Action> = None;
         for d in &self.transfer_dirs {
-            if ui.button(d.display().to_string()).clicked() {
+            if icons::menu_item(ui, Some(&ic.folder), d.display().to_string(), "", true).clicked() {
                 act = Some(Action::Transfer(files.to_vec(), d.clone(), mv));
             }
         }
         if self.transfer_dirs.is_empty() {
             ui.weak("아직 없음");
         }
-        ui.separator();
-        if ui.button("폴더 선택…").clicked() {
+        icons::menu_sep(ui);
+        if icons::menu_item(ui, Some(&ic.folder), "폴더 선택…", "", true).clicked() {
             act = Some(Action::PickAndTransfer(files.to_vec(), mv));
         }
         if let Some(a) = act {
@@ -1171,48 +1173,49 @@ impl App {
         let any = !targets.is_empty();
         let deletable = any && targets.iter().all(|p| p.parent().is_some());
         let mut act: Option<Action> = None;
-        let item = |ui: &mut Ui, enabled: bool, text: &str, key: &str| {
-            ui.add_enabled(enabled, egui::Button::new(text).shortcut_text(key)).clicked()
+        let ic = self.icons.clone();
+        let item = |ui: &mut Ui, icon: Option<&TextureHandle>, enabled: bool, text: &str, key: &str| {
+            icons::menu_item(ui, icon, text, key, enabled).clicked()
         };
-        ui.set_min_width(220.0);
+        icons::style_menu(ui, 240.0);
 
-        if item(ui, true, "폴더 생성(N)", "Ctrl+N") {
+        if item(ui, Some(&ic.folder), true, "폴더 생성(N)", "Ctrl+N") {
             act = Some(Action::NewFolder(paste_dir.clone()));
         }
         match &fav_target {
             Some(f) if self.favorites.contains(f) => {
-                if item(ui, true, "즐겨찾기에서 제거(A)", "") {
+                if item(ui, Some(&ic.star), true, "즐겨찾기에서 제거(A)", "") {
                     act = Some(Action::RemoveFavorite(f.clone()));
                 }
             }
             _ => {
-                if item(ui, fav_target.is_some(), "즐겨찾기에 추가(A)", "") {
+                if item(ui, Some(&ic.star), fav_target.is_some(), "즐겨찾기에 추가(A)", "") {
                     act = fav_target.clone().map(Action::AddFavorite);
                 }
             }
         }
-        ui.separator();
-        if item(ui, deletable, "잘라내기(X)", "Ctrl+X") {
+        icons::menu_sep(ui);
+        if item(ui, None, deletable, "잘라내기(X)", "Ctrl+X") {
             act = Some(Action::Cut(targets.clone()));
         }
-        if item(ui, any, "복사(C)", "Ctrl+C") {
+        if item(ui, None, any, "복사(C)", "Ctrl+C") {
             act = Some(Action::Copy(targets.clone()));
         }
-        if item(ui, fileops::clipboard_has_files(), "붙여넣기(V)", "Ctrl+V") {
+        if item(ui, None, fileops::clipboard_has_files(), "붙여넣기(V)", "Ctrl+V") {
             act = Some(Action::Paste(paste_dir.clone()));
         }
-        ui.separator();
-        if item(ui, deletable, "삭제(D)", "Del") {
+        icons::menu_sep(ui);
+        if item(ui, Some(&ic.delete), deletable, "삭제(D)", "Del") {
             act = Some(Action::Delete(targets.clone()));
         }
-        if item(ui, targets.len() == 1 && deletable, "이름 변경(U)", "F2") {
+        if item(ui, Some(&ic.rename), targets.len() == 1 && deletable, "이름 변경(U)", "F2") {
             act = Some(Action::Rename(targets[0].clone()));
         }
-        ui.separator();
-        if item(ui, true, "파일 속성(Z)", "") {
+        icons::menu_sep(ui);
+        if item(ui, None, true, "파일 속성(Z)", "") {
             act = Some(Action::Properties(targets.first().cloned().unwrap_or_else(|| dir.clone())));
         }
-        if item(ui, true, "새로고침(Y)", "F5") {
+        if item(ui, Some(&ic.refresh), true, "새로고침(Y)", "F5") {
             act = Some(Action::Refresh(dir.clone()));
         }
         if let Some(a) = act {
@@ -1404,9 +1407,11 @@ impl App {
             }
             let mut go: Option<PathBuf> = None;
             egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-                ui.set_min_width(320.0);
+                icons::style_menu(ui, 320.0);
                 for (k, p) in self.recent.iter().enumerate() {
-                    if ui.selectable_label(*p == self.cur_dir, format!("{}  {}", k + 1, p.display())).clicked() {
+                    let text = egui::RichText::new(format!("{}   {}", k + 1, p.display()));
+                    let text = if *p == self.cur_dir { text.strong() } else { text };
+                    if icons::menu_item(ui, Some(&ic.folder), text, "", true).clicked() {
                         go = Some(p.clone());
                     }
                 }
@@ -1452,21 +1457,27 @@ impl App {
             }
             let r = tool_button(ui, &ic.more, "더보기", true);
             let pid = ui.make_persistent_id("more_popup");
+            // PICVIEW_SHOW_MENU=1 opens this popup once at start (for screenshots of the menu style)
+            static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if std::env::var_os("PICVIEW_SHOW_MENU").is_some() && !SHOWN.swap(true, Ordering::Relaxed) {
+                ui.memory_mut(|m| m.open_popup(pid));
+            }
             if r.clicked() {
                 ui.memory_mut(|m| m.toggle_popup(pid));
             }
             egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-                ui.set_min_width(180.0);
-                if ui.button("설정…").clicked() {
+                icons::style_menu(ui, 240.0);
+                if icons::menu_item(ui, Some(&ic.settings), "설정…", "", true).clicked() {
                     self.open_settings();
                 }
-                if ui.button("썸네일 캐시 비우기").clicked() {
+                icons::menu_sep(ui);
+                if icons::menu_item(ui, Some(&ic.delete), "썸네일 캐시 비우기", "", true).clicked() {
                     self.status = match cache::clear() {
                         Ok(()) => "썸네일 캐시를 비웠습니다".into(),
                         Err(e) => format!("캐시 비우기 실패: {e}"),
                     };
                 }
-                if ui.button("캐시 폴더 열기").clicked() {
+                if icons::menu_item(ui, Some(&ic.folder), "캐시 폴더 열기", "", true).clicked() {
                     if let Some(d) = cache::dir() {
                         let _ = std::process::Command::new("explorer").arg(d).spawn();
                     }
@@ -1585,12 +1596,14 @@ impl App {
                 if r.clicked() {
                     self.actions.push(Action::Go(f.clone()));
                 }
+                let ic = self.icons.clone();
                 r.context_menu(|ui| {
-                    if ui.button("열기").clicked() {
+                    icons::style_menu(ui, 200.0);
+                    if icons::menu_item(ui, Some(&ic.folder), "열기", "", true).clicked() {
                         self.actions.push(Action::Go(f.clone()));
                         ui.close_menu();
                     }
-                    if ui.button("즐겨찾기에서 제거").clicked() {
+                    if icons::menu_item(ui, Some(&ic.star), "즐겨찾기에서 제거", "", true).clicked() {
                         self.actions.push(Action::RemoveFavorite(f.clone()));
                         ui.close_menu();
                     }
@@ -1823,34 +1836,38 @@ impl App {
             ui.painter().rect_filled(rect, 4.0f32, Color32::from_white_alpha(150));
         }
         let targets = if selected { self.selected_paths() } else { vec![path.clone()] };
+        let is_folder = self.entries[i].is_dir;
+        let ic = self.icons.clone();
         resp.context_menu(|ui| {
+            icons::style_menu(ui, 240.0);
             let open = egui::RichText::new(if is_img { "크게보기" } else { "열기" }).strong();
-            if ui.add(egui::Button::new(open).shortcut_text("Enter")).clicked() {
+            let open_icon = if is_img { Some(&ic.view) } else if is_folder { Some(&ic.folder) } else { None };
+            if icons::menu_item(ui, open_icon, open, "Enter", true).clicked() {
                 self.actions.push(Action::Open(i));
                 ui.close_menu();
             }
             if is_img {
-                if ui.add(egui::Button::new("시계 방향으로 회전").shortcut_text("R")).clicked() {
+                if icons::menu_item(ui, Some(&ic.rotate_right), "시계 방향으로 회전", "R", true).clicked() {
                     self.actions.push(Action::Rotate(targets.clone(), 1));
                     ui.close_menu();
                 }
-                if ui.add(egui::Button::new("시계 반대 방향으로 회전").shortcut_text("L")).clicked() {
+                if icons::menu_item(ui, Some(&ic.rotate_left), "시계 반대 방향으로 회전", "L", true).clicked() {
                     self.actions.push(Action::Rotate(targets.clone(), -1));
                     ui.close_menu();
                 }
             }
-            ui.separator();
+            icons::menu_sep(ui);
             let dir = self.cur_dir.clone();
             self.file_menu(ui, targets.clone(), dir);
-            ui.separator();
-            ui.menu_button("복사할 곳", |ui| self.dest_menu(ui, &targets, false));
-            ui.menu_button("이동할 곳", |ui| self.dest_menu(ui, &targets, true));
-            ui.separator();
-            if ui.button("탐색기에서 보기").clicked() {
+            icons::menu_sep(ui);
+            ui.menu_button("      복사할 곳", |ui| self.dest_menu(ui, &targets, false));
+            ui.menu_button("      이동할 곳", |ui| self.dest_menu(ui, &targets, true));
+            icons::menu_sep(ui);
+            if icons::menu_item(ui, Some(&ic.explorer), "탐색기에서 보기", "", true).clicked() {
                 self.actions.push(Action::ShowInExplorer(path.clone()));
                 ui.close_menu();
             }
-            if ui.button("경로 복사").clicked() {
+            if icons::menu_item(ui, None, "경로 복사", "", true).clicked() {
                 ui.ctx().copy_text(path.display().to_string());
                 ui.close_menu();
             }
