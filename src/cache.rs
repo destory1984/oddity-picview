@@ -1,6 +1,6 @@
 //! On-disk thumbnail cache.
 //!
-//! Layout: %LOCALAPPDATA%\picview\thumbs\<2 hex>\<16 hex>.jpg|.png
+//! Layout: %LOCALAPPDATA%\oddity-picview\thumbs\<2 hex>\<16 hex>.jpg|.png
 //! The key hashes the full path, file size and mtime, so an edited file gets a
 //! new entry and the stale one ages out through `trim`.
 
@@ -20,8 +20,11 @@ const VERSION: u64 = 1;
 pub fn dir() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let base = std::env::var_os("LOCALAPPDATA")?;
-        let d = PathBuf::from(base).join("picview").join("thumbs");
+        // PICVIEW_CACHE_DIR lets benchmarks run against an empty cache
+        let d = match std::env::var_os("PICVIEW_CACHE_DIR") {
+            Some(d) => PathBuf::from(d),
+            None => PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join(crate::APP_ID).join("thumbs"),
+        };
         std::fs::create_dir_all(&d).ok()?;
         Some(d)
     })

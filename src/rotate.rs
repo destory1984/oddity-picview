@@ -21,6 +21,9 @@ pub fn save_rotation(path: &Path, quarter_cw: i32) -> Result<(), String> {
         let out = jpeg_set_orientation(&bytes, compose(cur, q))?;
         return write_atomic(path, &out);
     }
+    if crate::loader::is_wic(path) {
+        return Err("HEIC, RAW는 파일 회전을 지원하지 않습니다 (보기만 돌립니다)".into());
+    }
     if matches!(ext.as_str(), "gif" | "ico") {
         return Err("GIF, ICO는 파일 회전을 지원하지 않습니다 (보기만 돌립니다)".into());
     }

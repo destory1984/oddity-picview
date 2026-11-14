@@ -1,2 +1,4 @@
 /target
 *.log
+/bench/photos
+/bench/out

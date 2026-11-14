@@ -2,6 +2,7 @@
 
 mod cache;
 mod fileops;
+mod icons;
 mod loader;
 mod rotate;
 
@@ -16,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime};
+
+/// Folder name for settings (%APPDATA%) and the thumbnail cache (%LOCALAPPDATA%).
+pub const APP_ID: &str = "oddity-picview";
 
 const GAP: f32 = 8.0;
 const MAX_THUMBS_LOADED: usize = 800;
@@ -60,6 +64,8 @@ enum Msg {
     Skip { gen: u64, idx: usize },
     Big { path: PathBuf, mtime: Option<SystemTime>, res: Result<(TextureHandle, [u32; 2]), String> },
     Rotated { path: PathBuf, turns: i32, res: Result<(), String> },
+    /// frames of an animated GIF, sent after its first frame (`Big`)
+    Anim { path: PathBuf, frames: Vec<(TextureHandle, Duration)> },
     OpDone { status: String, dirs: Vec<PathBuf>, clear_clipboard: bool },
 }
 
@@ -80,7 +86,16 @@ enum Action {
     Rotate(Vec<PathBuf>, i32),
     ShowInExplorer(PathBuf),
     Go(PathBuf),
+    /// copy (false) or move (true) files into a folder
+    Transfer(Vec<PathBuf>, PathBuf, bool),
+    /// ask for a folder with the system dialog, then copy / move there
+    PickAndTransfer(Vec<PathBuf>, bool),
 }
+
+/// Drag-and-drop payload: the files being dragged.
+struct DragFiles(Vec<PathBuf>);
+
+const TRANSFER_MAX: usize = 10;
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 enum SortKey {
@@ -91,7 +106,7 @@ enum SortKey {
 
 const RECENT_MAX: usize = 10;
 
-/// Saved between runs (eframe storage, %APPDATA%/picview/data/app.ron).
+/// Saved between runs (eframe storage, %APPDATA%/oddity-picview/data/app.ron).
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct Settings {
@@ -101,6 +116,8 @@ struct Settings {
     sort_desc: bool,
     thumb_size: f32,
     favorites: Vec<PathBuf>,
+    /// last 10 folders files were copied / moved into
+    transfer_dirs: Vec<PathBuf>,
 }
 
 impl Default for Settings {
@@ -112,8 +129,16 @@ impl Default for Settings {
             sort_desc: false,
             thumb_size: 160.0,
             favorites: Vec::new(),
+            transfer_dirs: Vec::new(),
         }
     }
+}
+
+/// Animated GIF being shown: frame textures with their display times.
+struct Anim {
+    frames: Vec<(TextureHandle, Duration)>,
+    total: Duration,
+    start: Instant,
 }
 
 struct Viewer {
@@ -166,6 +191,7 @@ struct App {
 
     big: HashMap<PathBuf, Big>,
     big_order: VecDeque<PathBuf>,
+    anims: HashMap<PathBuf, Anim>,
     rot: HashMap<PathBuf, i32>,
 
     viewer: Option<Viewer>,
@@ -187,6 +213,10 @@ struct App {
     rot_saving: HashMap<PathBuf, i32>,
     /// rotation already written to the file but not to this loaded texture
     baked: HashMap<egui::TextureId, i32>,
+    icons: Arc<icons::Icons>,
+    transfer_dirs: Vec<PathBuf>,
+    /// folder under the pointer while dragging files (set by drop targets each frame)
+    dnd_target: Option<PathBuf>,
 }
 
 impl App {
@@ -232,6 +262,7 @@ impl App {
             sort_desc: saved.sort_desc,
             big: HashMap::new(),
             big_order: VecDeque::new(),
+            anims: HashMap::new(),
             rot: HashMap::new(),
             viewer: None,
             fullscreen: false,
@@ -247,6 +278,9 @@ impl App {
             ctrl_v_prev: false,
             rot_saving: HashMap::new(),
             baked: HashMap::new(),
+            icons: Arc::new(icons::Icons::new(&cc.egui_ctx)),
+            transfer_dirs: saved.transfer_dirs.iter().filter(|p| p.is_dir()).take(TRANSFER_MAX).cloned().collect(),
+            dnd_target: None,
             recent: saved.recent.into_iter().filter(|p| p.is_dir()).take(RECENT_MAX).collect(),
         };
 
@@ -503,6 +537,23 @@ impl App {
         self.rot.get(p).copied().unwrap_or(0)
     }
 
+    /// Frame of the animated GIF `p` to show now, scheduling the next repaint.
+    fn anim_frame(&self, p: &Path) -> Option<TextureHandle> {
+        let a = self.anims.get(p)?;
+        if a.total.is_zero() {
+            return None;
+        }
+        let mut t = Duration::from_nanos((a.start.elapsed().as_nanos() % a.total.as_nanos()) as u64);
+        for (tex, d) in &a.frames {
+            if t < *d {
+                self.ctx.request_repaint_after(*d - t);
+                return Some(tex.clone());
+            }
+            t -= *d;
+        }
+        a.frames.last().map(|f| f.0.clone())
+    }
+
     /// Rotation to draw `tex` of file `p` with: turns not yet in the file,
     /// plus turns already in the file but not in this texture.
     fn disp_rot(&self, p: &Path, tex: &TextureHandle) -> i32 {
@@ -591,7 +642,9 @@ impl App {
             return;
         }
         self.thumbs[i] = Thumb::Pending;
-        let (path, size, modified, media) = (e.path.clone(), e.size, e.modified, e.media.is_some());
+        // video, audio, HEIC and RAW: the shell's thumbnail (RAW has a fast embedded preview)
+        let shell = e.media.is_some() || loader::is_wic(&e.path);
+        let (path, size, modified, media) = (e.path.clone(), e.size, e.modified, shell);
         let gen = self.gen.load(Ordering::SeqCst);
         let (gen_now, vs, ve) = (self.gen.clone(), self.vis_start.clone(), self.vis_end.clone());
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
@@ -643,6 +696,7 @@ impl App {
         while self.big_order.len() > BIG_CACHE {
             if let Some(old) = self.big_order.pop_front() {
                 self.big.remove(&old);
+                self.anims.remove(&old);
             }
         }
         let mtime = self.index_of(path).map(|i| self.entries[i].modified);
@@ -650,12 +704,34 @@ impl App {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let max_side = ctx.input(|i| i.max_texture_side).min(16384) as u32;
         std::thread::spawn(move || {
-            let res = loader::load_full(&path, max_side).map(|(img, dims)| {
+            let decoded = if loader::is_wic(&path) {
+                fileops::wic_decode(&path, max_side).map(|(img, dims, o)| loader::orient(img, dims, o))
+            } else {
+                loader::load_full(&path, max_side)
+            };
+            let res = decoded.map(|(img, dims)| {
                 let ci = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
                 (ctx.load_texture(path.display().to_string(), ci, tex_opts()), dims)
             });
-            let _ = tx.send(Msg::Big { path, mtime, res });
+            let ok = res.is_ok();
+            let _ = tx.send(Msg::Big { path: path.clone(), mtime, res });
             ctx.request_repaint();
+            // animated GIF: the first frame is up already, the rest follow
+            let is_gif = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif"));
+            if ok && is_gif {
+                if let Some(frames) = loader::load_gif_frames(&path, max_side) {
+                    let frames = frames
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, (img, delay))| {
+                            let ci = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                            (ctx.load_texture(format!("{}#{k}", path.display()), ci, tex_opts()), delay)
+                        })
+                        .collect();
+                    let _ = tx.send(Msg::Anim { path, frames });
+                    ctx.request_repaint();
+                }
+            }
         });
     }
 
@@ -679,6 +755,12 @@ impl App {
                     }
                 }
                 Msg::Rotated { path, turns, res } => self.on_rotated(path, turns, res),
+                Msg::Anim { path, frames } => {
+                    if self.big.contains_key(&path) {
+                        let total = frames.iter().map(|f| f.1).sum();
+                        self.anims.insert(path, Anim { frames, total, start: Instant::now() });
+                    }
+                }
                 Msg::OpDone { status, dirs, clear_clipboard } => {
                     self.status = status;
                     if clear_clipboard {
@@ -901,7 +983,100 @@ impl App {
             Action::Refresh(d) => self.refresh_dir(&d),
             Action::Rotate(ps, d) => self.rotate_paths(ps, d),
             Action::ShowInExplorer(p) => self.show_in_explorer(&p),
+            Action::Transfer(files, dest, mv) => self.transfer(files, dest, mv, false),
+            Action::PickAndTransfer(files, mv) => {
+                let title = if mv { "옮길 폴더 선택" } else { "복사할 폴더 선택" };
+                if let Some(dest) = rfd::FileDialog::new().set_title(title).set_directory(&self.cur_dir).pick_folder() {
+                    self.transfer(files, dest, mv, false);
+                }
+            }
         }
+    }
+
+    /// Submenu listing the last folders files went to, plus a folder picker.
+    fn dest_menu(&mut self, ui: &mut Ui, files: &[PathBuf], mv: bool) {
+        ui.set_min_width(280.0);
+        let mut act: Option<Action> = None;
+        for d in &self.transfer_dirs {
+            if ui.button(d.display().to_string()).clicked() {
+                act = Some(Action::Transfer(files.to_vec(), d.clone(), mv));
+            }
+        }
+        if self.transfer_dirs.is_empty() {
+            ui.weak("아직 없음");
+        }
+        ui.separator();
+        if ui.button("폴더 선택…").clicked() {
+            act = Some(Action::PickAndTransfer(files.to_vec(), mv));
+        }
+        if let Some(a) = act {
+            self.actions.push(a);
+            ui.close_menu();
+        }
+    }
+
+    /// Default drop: move within the same drive, copy to another drive (like
+    /// Explorer). Ctrl forces copy, Shift forces move.
+    fn drop_is_move(&self, files: &[PathBuf], dest: &Path) -> bool {
+        let m = self.ctx.input(|i| i.modifiers);
+        if m.ctrl {
+            false
+        } else if m.shift {
+            true
+        } else {
+            files.first().is_some_and(|f| same_volume(f, dest))
+        }
+    }
+
+    /// Make `resp` (a folder) accept dragged files.
+    fn drop_target(&mut self, ui: &Ui, resp: &egui::Response, dir: &Path) {
+        if let Some(drag) = resp.dnd_hover_payload::<DragFiles>() {
+            let valid = !drag.0.iter().any(|f| dir.starts_with(f)) // not into itself
+                && !drag.0.iter().all(|f| f.parent() == Some(dir)); // not where they already are
+            if valid {
+                ui.painter().rect_stroke(
+                    resp.rect.expand(1.0),
+                    4.0f32,
+                    Stroke::new(2.0f32, Color32::from_rgb(40, 120, 220)),
+                    egui::StrokeKind::Outside,
+                );
+                self.dnd_target = Some(dir.to_path_buf());
+            }
+        }
+        if let Some(drag) = resp.dnd_release_payload::<DragFiles>() {
+            if self.dnd_target.as_deref() == Some(dir) {
+                let mv = self.drop_is_move(&drag.0, dir);
+                self.actions.push(Action::Transfer(drag.0.clone(), dir.to_path_buf(), mv));
+            }
+        }
+    }
+
+    /// Label that follows the pointer while dragging files.
+    fn drag_overlay(&mut self, ctx: &egui::Context) {
+        let Some(drag) = egui::DragAndDrop::payload::<DragFiles>(ctx) else {
+            self.dnd_target = None;
+            return;
+        };
+        let Some(pos) = ctx.pointer_hover_pos() else { return };
+        let text = match &self.dnd_target {
+            Some(dest) => {
+                let mv = self.drop_is_move(&drag.0, dest);
+                ctx.set_cursor_icon(if mv { egui::CursorIcon::Move } else { egui::CursorIcon::Copy });
+                let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dest.display().to_string());
+                format!("{}개 → {name} ({})", drag.0.len(), if mv { "이동" } else { "복사" })
+            }
+            None => {
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                format!("{}개 항목 (Ctrl: 복사, Shift: 이동)", drag.0.len())
+            }
+        };
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("dnd_label")));
+        let at = pos + vec2(16.0, 18.0);
+        let galley = painter.layout_no_wrap(text, FontId::proportional(13.0), Color32::WHITE);
+        let r = Rect::from_min_size(at, galley.size()).expand(6.0);
+        painter.rect_filled(r, 4.0f32, Color32::from_rgba_unmultiplied(30, 60, 110, 230));
+        painter.galley(at, galley, Color32::WHITE);
+        self.dnd_target = None; // drop targets set it again next frame
     }
 
     fn paste(&mut self, dest: PathBuf) {
@@ -909,6 +1084,14 @@ impl App {
             self.status = "붙여넣을 파일이 없습니다".into();
             return;
         };
+        self.transfer(files, dest, cut, cut);
+    }
+
+    /// Copy or move `files` into `dest` on a worker thread with Explorer's dialogs.
+    fn transfer(&mut self, files: Vec<PathBuf>, dest: PathBuf, cut: bool, from_clipboard: bool) {
+        if files.is_empty() {
+            return;
+        }
         if cut && files.iter().all(|f| f.parent() == Some(dest.as_path())) {
             self.status = "같은 폴더라서 옮길 것이 없습니다".into();
             return;
@@ -916,6 +1099,12 @@ impl App {
         if files.iter().any(|f| dest.starts_with(f)) {
             self.status = "폴더를 그 안으로 복사하거나 옮길 수 없습니다".into();
             return;
+        }
+        self.transfer_dirs.retain(|d| d != &dest);
+        self.transfer_dirs.insert(0, dest.clone());
+        self.transfer_dirs.truncate(TRANSFER_MAX);
+        if cut {
+            self.cut_paths.retain(|p| !files.contains(p));
         }
         let mut dirs = vec![dest.clone()];
         if cut {
@@ -925,15 +1114,15 @@ impl App {
         dirs.dedup();
         let n = files.len();
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
-        self.status = "붙여넣는 중…".into();
+        self.status = format!("{}하는 중…", if cut { "옮기" } else { "복사" });
         std::thread::spawn(move || {
             let res = fileops::shell_copy_move(&files, &dest, cut);
             let status = match &res {
                 Ok(true) => format!("{n}개 항목을 {}습니다", if cut { "옮겼" } else { "복사했" }),
-                Ok(false) => "붙여넣기를 일부 취소했습니다".into(),
-                Err(e) => format!("붙여넣기 실패: {e}"),
+                Ok(false) => "일부를 취소했습니다".into(),
+                Err(e) => format!("{} 실패: {e}", if cut { "옮기기" } else { "복사" }),
             };
-            let clear_clipboard = cut && matches!(res, Ok(true));
+            let clear_clipboard = from_clipboard && cut && matches!(res, Ok(true));
             let _ = tx.send(Msg::OpDone { status, dirs, clear_clipboard });
             ctx.request_repaint();
         });
@@ -1035,8 +1224,12 @@ impl App {
     fn tree_node(&mut self, ui: &mut Ui, path: &Path, label: String, nav: &mut Option<PathBuf>) {
         let state = CollapsingState::load_with_default_open(ui.ctx(), tree_id(path), false);
         let selected = self.cur_dir == path;
+        let folder = self.icons.folder.id();
         let header = state.show_header(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.add(egui::Image::new(SizedTexture::new(folder, vec2(16.0, 16.0))));
             let r = ui.selectable_label(selected, label);
+            self.drop_target(ui, &r, path);
             if r.clicked() {
                 *nav = Some(path.to_path_buf());
             }
@@ -1157,61 +1350,64 @@ impl App {
     }
 
     fn toolbar(&mut self, ui: &mut Ui) {
+        use icons::tool_button;
+        let ic = self.icons.clone();
         ui.horizontal(|ui| {
-            ui.spacing_mut().button_padding = vec2(8.0, 5.0);
-            if ui.add_enabled(!self.back.is_empty(), egui::Button::new("◀")).on_hover_text("뒤로 (Alt+←)").clicked() {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if tool_button(ui, &ic.back, "뒤로", !self.back.is_empty()).on_hover_text("Alt+←").clicked() {
                 self.go_back();
             }
-            if ui.add_enabled(!self.fwd.is_empty(), egui::Button::new("▶")).on_hover_text("앞으로 (Alt+→)").clicked() {
+            if tool_button(ui, &ic.forward, "앞으로", !self.fwd.is_empty()).on_hover_text("Alt+→").clicked() {
                 self.go_fwd();
             }
-            if ui.add_enabled(self.cur_dir.parent().is_some(), egui::Button::new("▲")).on_hover_text("위로 (Backspace)").clicked() {
+            if tool_button(ui, &ic.up, "위로", self.cur_dir.parent().is_some()).on_hover_text("Backspace").clicked() {
                 self.go_up();
             }
+            let r = tool_button(ui, &ic.recent, "최근", true).on_hover_text("최근에 연 폴더 10개");
+            let pid = ui.make_persistent_id("recent_popup");
+            if r.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(pid));
+            }
             let mut go: Option<PathBuf> = None;
-            ui.menu_button("최근 ▼", |ui| {
+            egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                ui.set_min_width(320.0);
                 for (k, p) in self.recent.iter().enumerate() {
-                    let here = *p == self.cur_dir;
-                    if ui.selectable_label(here, format!("{}  {}", k + 1, p.display())).clicked() {
+                    if ui.selectable_label(*p == self.cur_dir, format!("{}  {}", k + 1, p.display())).clicked() {
                         go = Some(p.clone());
-                        ui.close_menu();
                     }
                 }
                 if self.recent.is_empty() {
                     ui.weak("없음");
                 }
-            })
-            .response
-            .on_hover_text("최근에 연 폴더 10개");
+            });
             if let Some(p) = go {
                 self.navigate(p, true);
             }
-            if ui.button("새로고침").on_hover_text("F5").clicked() {
-                self.reload(None);
+            if tool_button(ui, &ic.refresh, "새로고침", true).on_hover_text("F5").clicked() {
+                self.actions.push(Action::Refresh(self.cur_dir.clone()));
             }
             ui.separator();
 
             let has_img = self.focus.and_then(|i| self.entries.get(i)).map(|e| e.is_img()).unwrap_or(false);
             let has_sel = !self.selected_paths().is_empty();
-            if ui.add_enabled(has_img, egui::Button::new("크게보기")).on_hover_text("Enter").clicked() {
+            if tool_button(ui, &ic.view, "크게보기", has_img).on_hover_text("Enter").clicked() {
                 if let Some(f) = self.focus {
                     self.open_entry(f);
                 }
             }
-            if ui.add_enabled(has_sel, egui::Button::new("-90° 회전")).clicked() {
+            if tool_button(ui, &ic.rotate_left, "-90° 회전", has_sel).on_hover_text("파일에 저장됩니다").clicked() {
                 self.rotate_current(-1);
             }
-            if ui.add_enabled(has_sel, egui::Button::new("90° 회전")).clicked() {
+            if tool_button(ui, &ic.rotate_right, "90° 회전", has_sel).on_hover_text("파일에 저장됩니다").clicked() {
                 self.rotate_current(1);
             }
-            if ui.add_enabled(self.focus.is_some(), egui::Button::new("이름변경")).on_hover_text("F2").clicked() {
+            if tool_button(ui, &ic.rename, "이름변경", self.focus.is_some()).on_hover_text("F2").clicked() {
                 self.ask_rename();
             }
-            if ui.add_enabled(has_sel, egui::Button::new("삭제")).on_hover_text("Delete (휴지통으로)").clicked() {
-                let p = self.selected_paths();
-                self.ask_delete(p);
+            if tool_button(ui, &ic.delete, "삭제", has_sel).on_hover_text("Delete (휴지통으로)").clicked() {
+                self.actions.push(Action::Delete(self.selected_paths()));
             }
-            if ui.button("탐색기").on_hover_text("탐색기에서 열기").clicked() {
+            if tool_button(ui, &ic.explorer, "탐색기", true).on_hover_text("탐색기에서 열기").clicked() {
                 let p = self.focus.and_then(|i| self.entries.get(i)).map(|e| e.path.clone());
                 match p {
                     Some(p) => self.show_in_explorer(&p),
@@ -1220,52 +1416,64 @@ impl App {
                     }
                 }
             }
-            ui.menu_button("더보기", |ui| {
+            let r = tool_button(ui, &ic.more, "더보기", true);
+            let pid = ui.make_persistent_id("more_popup");
+            if r.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(pid));
+            }
+            egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                ui.set_min_width(180.0);
                 if ui.button("썸네일 캐시 비우기").clicked() {
                     self.status = match cache::clear() {
                         Ok(()) => "썸네일 캐시를 비웠습니다".into(),
                         Err(e) => format!("캐시 비우기 실패: {e}"),
                     };
-                    ui.close_menu();
                 }
                 if ui.button("캐시 폴더 열기").clicked() {
                     if let Some(d) = cache::dir() {
                         let _ = std::process::Command::new("explorer").arg(d).spawn();
                     }
-                    ui.close_menu();
                 }
             });
             ui.separator();
 
-            ui.label("정렬");
-            let before = (self.sort, self.sort_desc);
-            egui::ComboBox::from_id_salt("sort")
-                .width(60.0)
-                .selected_text(match self.sort {
-                    SortKey::Name => "이름",
-                    SortKey::Date => "날짜",
-                    SortKey::Size => "크기",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.sort, SortKey::Name, "이름");
-                    ui.selectable_value(&mut self.sort, SortKey::Date, "날짜");
-                    ui.selectable_value(&mut self.sort, SortKey::Size, "크기");
-                });
-            if ui.button(if self.sort_desc { "내림차순" } else { "오름차순" }).clicked() {
-                self.sort_desc = !self.sort_desc;
-            }
-            if before != (self.sort, self.sort_desc) {
-                self.sort_entries();
-            }
-            ui.separator();
-            ui.label("크기");
-            if ui.button(" - ").on_hover_text("작게").clicked() {
-                self.thumb_size = (self.thumb_size - 16.0).max(64.0);
-            }
-            ui.add(egui::Slider::new(&mut self.thumb_size, 64.0..=256.0).show_value(false));
-            if ui.button(" + ").on_hover_text("크게").clicked() {
-                self.thumb_size = (self.thumb_size + 16.0).min(256.0);
-            }
+            // sort and size controls, centred on the button row
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), 56.0),
+                egui::Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label("정렬");
+                    let before = (self.sort, self.sort_desc);
+                    egui::ComboBox::from_id_salt("sort")
+                        .width(60.0)
+                        .selected_text(match self.sort {
+                            SortKey::Name => "이름",
+                            SortKey::Date => "날짜",
+                            SortKey::Size => "크기",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.sort, SortKey::Name, "이름");
+                            ui.selectable_value(&mut self.sort, SortKey::Date, "날짜");
+                            ui.selectable_value(&mut self.sort, SortKey::Size, "크기");
+                        });
+                    if ui.button(if self.sort_desc { "내림차순" } else { "오름차순" }).clicked() {
+                        self.sort_desc = !self.sort_desc;
+                    }
+                    if before != (self.sort, self.sort_desc) {
+                        self.sort_entries();
+                    }
+                    ui.separator();
+                    ui.label("크기");
+                    if ui.button(" - ").on_hover_text("작게").clicked() {
+                        self.thumb_size = (self.thumb_size - 16.0).max(64.0);
+                    }
+                    ui.add(egui::Slider::new(&mut self.thumb_size, 64.0..=256.0).show_value(false));
+                    if ui.button(" + ").on_hover_text("크게").clicked() {
+                        self.thumb_size = (self.thumb_size + 16.0).min(256.0);
+                    }
+                },
+            );
         });
     }
 
@@ -1324,7 +1532,16 @@ impl App {
             ui.weak("즐겨찾기");
             for f in self.favorites.clone() {
                 let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| f.display().to_string());
-                let r = ui.selectable_label(self.cur_dir == f, format!("★ {name}")).on_hover_text(f.display().to_string());
+                let star = self.icons.star.id();
+                let r = ui
+                    .horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.add(egui::Image::new(SizedTexture::new(star, vec2(16.0, 16.0))));
+                        ui.selectable_label(self.cur_dir == f, name)
+                    })
+                    .inner
+                    .on_hover_text(f.display().to_string());
+                self.drop_target(ui, &r, &f);
                 if r.clicked() {
                     self.actions.push(Action::Go(f.clone()));
                 }
@@ -1453,7 +1670,13 @@ impl App {
     }
 
     fn cell(&mut self, ui: &mut Ui, i: usize, rect: Rect) {
-        let resp = ui.interact(rect, Id::new(("cell", i)), Sense::click());
+        let resp = ui.interact(rect, Id::new(("cell", i)), Sense::click_and_drag());
+        if resp.drag_started() {
+            if !self.selected.contains(&i) {
+                self.select_single(i);
+            }
+            resp.dnd_set_drag_payload(DragFiles(self.selected_paths()));
+        }
         let selected = self.selected.contains(&i);
         let painter = ui.painter();
         let bg = if selected {
@@ -1471,7 +1694,8 @@ impl App {
         let img_area = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(ts, ts));
         let e = &self.entries[i];
         if e.is_dir {
-            draw_folder(painter, img_area);
+            let fr = Rect::from_center_size(img_area.center(), img_area.size() * 0.60);
+            painter.image(self.icons.folder.id(), fr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         } else {
             match &self.thumbs[i] {
                 Thumb::Ready(t) => {
@@ -1516,6 +1740,9 @@ impl App {
         } else if resp.secondary_clicked() && !selected {
             self.select_single(i);
         }
+        if self.entries[i].is_dir {
+            self.drop_target(ui, &resp, &path);
+        }
         if self.cut_paths.contains(&path) {
             ui.painter().rect_filled(rect, 4.0f32, Color32::from_white_alpha(150));
         }
@@ -1539,6 +1766,9 @@ impl App {
             ui.separator();
             let dir = self.cur_dir.clone();
             self.file_menu(ui, targets.clone(), dir);
+            ui.separator();
+            ui.menu_button("복사할 곳", |ui| self.dest_menu(ui, &targets, false));
+            ui.menu_button("이동할 곳", |ui| self.dest_menu(ui, &targets, true));
             ui.separator();
             if ui.button("탐색기에서 보기").clicked() {
                 self.actions.push(Action::ShowInExplorer(path.clone()));
@@ -1585,7 +1815,9 @@ impl App {
         let (area, resp) = ui.allocate_exact_size(vec2(ui.available_width(), area_h), Sense::click());
         match (self.big.get(&e.path), &self.thumbs[i]) {
             (Some(Big::Ready(t, d)), _) => {
-                draw_image(ui, t, vec2(d[0] as f32, d[1] as f32), area, self.disp_rot(&e.path, t), None, Vec2::ZERO);
+                let rot = self.disp_rot(&e.path, t);
+                let t = self.anim_frame(&e.path).unwrap_or_else(|| t.clone());
+                draw_image(ui, &t, vec2(d[0] as f32, d[1] as f32), area, rot, None, Vec2::ZERO);
             }
             (Some(Big::Failed), _) => {
                 ui.painter().text(area.center(), Align2::CENTER_CENTER, "열 수 없는 그림", FontId::proportional(14.0), Color32::GRAY);
@@ -1784,7 +2016,8 @@ impl App {
                             v.pan += resp.drag_delta();
                         }
                         let pan = v.pan;
-                        draw_image(ui, t, img, area, rot, Some(scale), pan);
+                        let frame = self.anim_frame(&cur).unwrap_or_else(|| t.clone());
+                        draw_image(ui, &frame, img, area, rot, Some(scale), pan);
                         info = format!("{name}   ({pos}/{total})   {} x {}   {:.0}%", d[0], d[1], scale * 100.0);
                     }
                     Some(Big::Failed) => {
@@ -1942,6 +2175,7 @@ impl eframe::App for App {
             sort_desc: self.sort_desc,
             thumb_size: self.thumb_size,
             favorites: self.favorites.clone(),
+            transfer_dirs: self.transfer_dirs.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &s);
     }
@@ -1960,6 +2194,7 @@ impl eframe::App for App {
             self.browser_ui(ctx);
         }
         self.dialogs(ctx);
+        self.drag_overlay(ctx);
         self.run_actions();
         self.evict_thumbs();
     }
@@ -1969,6 +2204,12 @@ impl eframe::App for App {
 
 fn tex_opts() -> TextureOptions {
     TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR }
+}
+
+/// Same drive letter (or UNC share), compared case-insensitively.
+fn same_volume(a: &Path, b: &Path) -> bool {
+    let root = |p: &Path| p.components().next().map(|c| c.as_os_str().to_string_lossy().to_lowercase());
+    root(a) == root(b)
 }
 
 fn tree_id(p: &Path) -> Id {
@@ -1995,17 +2236,6 @@ fn draw_image(ui: &Ui, tex: &TextureHandle, img: Vec2, area: Rect, rot: i32, sca
     egui::Image::from_texture(SizedTexture::new(tex.id(), img))
         .rotate(q as f32 * std::f32::consts::FRAC_PI_2, Vec2::splat(0.5))
         .paint_at(ui, rect);
-}
-
-fn draw_folder(p: &egui::Painter, area: Rect) {
-    let w = area.width() * 0.62;
-    let h = w * 0.72;
-    let body = Rect::from_center_size(area.center() + vec2(0.0, w * 0.05), vec2(w, h));
-    let tab = Rect::from_min_size(body.min - vec2(0.0, h * 0.12), vec2(w * 0.42, h * 0.25));
-    p.rect_filled(tab, 3.0, Color32::from_rgb(232, 178, 50));
-    p.rect_filled(body, 4.0, Color32::from_rgb(250, 204, 80));
-    let front = Rect::from_min_max(body.min + vec2(0.0, h * 0.18), body.max);
-    p.rect_filled(front, 4.0, Color32::from_rgb(255, 218, 110));
 }
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -2133,14 +2363,29 @@ fn fmt_time(t: SystemTime) -> String {
     chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M").to_string()
 }
 
+/// Versions before the rename kept their data under "picview"; move it once.
+fn migrate_old_dirs() {
+    for var in ["APPDATA", "LOCALAPPDATA"] {
+        if let Some(base) = std::env::var_os(var).map(PathBuf::from) {
+            let (old, new) = (base.join("picview"), base.join(APP_ID));
+            if old.is_dir() && !new.exists() {
+                let _ = std::fs::rename(&old, &new);
+            }
+        }
+    }
+}
+
 fn main() -> eframe::Result {
+    migrate_old_dirs();
     let start = std::env::args_os().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([640.0, 400.0])
-            .with_title("그림 뷰어"),
+            .with_title("Oddity PicView"),
+        // PICVIEW_DATA_DIR keeps benchmark runs away from the user's settings
+        persistence_path: std::env::var_os("PICVIEW_DATA_DIR").map(|d| PathBuf::from(d).join("app.ron")),
         ..Default::default()
     };
-    eframe::run_native("picview", options, Box::new(move |cc| Ok(Box::new(App::new(cc, start)))))
+    eframe::run_native(APP_ID, options, Box::new(move |cc| Ok(Box::new(App::new(cc, start)))))
 }

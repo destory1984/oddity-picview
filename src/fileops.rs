@@ -143,7 +143,9 @@ pub fn shell_thumbnail(path: &Path, size: i32) -> Result<image::RgbaImage, Strin
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
     use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_RESIZETOFIT};
 
-    let wpath = wide(path.as_os_str());
+    // the shell parser only takes backslashes
+    let fixed = PathBuf::from(path.to_string_lossy().replace('/', "\\"));
+    let wpath = wide(fixed.as_os_str());
     unsafe {
         // worker threads: join the multithreaded COM apartment (no-op if already in)
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -193,6 +195,66 @@ pub fn shell_thumbnail(path: &Path, size: i32) -> Result<image::RgbaImage, Strin
     }
 }
 
+/// Decode with Windows Imaging Component: HEIC/HEIF, AVIF and camera RAW
+/// (the same codecs the Photos app uses; HEIF/RAW need the free Store
+/// extensions). Returns pixels (downscaled to fit `max_side`), the original
+/// size, and the EXIF orientation (1..=8) if the file has one.
+pub fn wic_decode(path: &Path, max_side: u32) -> Result<(image::RgbaImage, [u32; 2], Option<u8>), String> {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::Foundation::GENERIC_READ;
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICBitmapSource, IWICImagingFactory,
+        WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom,
+        WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+
+    let wpath = wide(path.as_os_str());
+    let err = |e: windows::core::Error| {
+        if e.code().0 as u32 == 0x88982F50 {
+            "이 형식을 읽을 코덱이 없습니다 (Microsoft Store의 HEIF / Raw 이미지 확장 필요)".to_string()
+        } else {
+            e.message()
+        }
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).map_err(err)?;
+        let decoder = factory
+            .CreateDecoderFromFilename(PCWSTR(wpath.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
+            .map_err(err)?;
+        let frame = decoder.GetFrame(0).map_err(err)?;
+        let (mut w, mut h) = (0u32, 0u32);
+        frame.GetSize(&mut w, &mut h).map_err(err)?;
+        let dims = [w, h];
+
+        let orientation = frame.GetMetadataQueryReader().ok().and_then(|q| {
+            let name: Vec<u16> = "System.Photo.Orientation".encode_utf16().chain([0]).collect();
+            let mut v = PROPVARIANT::default();
+            q.GetMetadataByName(PCWSTR(name.as_ptr()), &mut v).ok()?;
+            u16::try_from(&v).ok().map(|o| o as u8).filter(|o| (1..=8).contains(o))
+        });
+
+        let mut source: IWICBitmapSource = frame.cast().map_err(err)?;
+        if w > max_side || h > max_side {
+            let k = max_side as f64 / w.max(h) as f64;
+            let (nw, nh) = (((w as f64 * k) as u32).max(1), ((h as f64 * k) as u32).max(1));
+            let scaler = factory.CreateBitmapScaler().map_err(err)?;
+            scaler.Initialize(&source, nw, nh, WICBitmapInterpolationModeFant).map_err(err)?;
+            source = scaler.cast().map_err(err)?;
+            (w, h) = (nw, nh);
+        }
+        let conv = factory.CreateFormatConverter().map_err(err)?;
+        conv.Initialize(&source, &GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)
+            .map_err(err)?;
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        conv.CopyPixels(std::ptr::null(), w * 4, &mut px).map_err(err)?;
+        let img = image::RgbaImage::from_raw(w, h, px).ok_or("bad size")?;
+        Ok((img, dims, orientation))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// PICVIEW_MEDIA=<file> PICVIEW_OUT=<png> cargo test --release shell_thumb -- --ignored
@@ -202,6 +264,18 @@ mod tests {
         let p = std::env::var("PICVIEW_MEDIA").expect("set PICVIEW_MEDIA");
         let img = super::shell_thumbnail(std::path::Path::new(&p), 256).expect("thumbnail");
         println!("{}x{}", img.width(), img.height());
+        if let Ok(out) = std::env::var("PICVIEW_OUT") {
+            img.save(out).unwrap();
+        }
+    }
+
+    /// PICVIEW_MEDIA=<heic or raw> PICVIEW_OUT=<png> cargo test --release wic_full -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn wic_full() {
+        let p = std::env::var("PICVIEW_MEDIA").expect("set PICVIEW_MEDIA");
+        let (img, dims, orient) = super::wic_decode(std::path::Path::new(&p), 1024).expect("decode");
+        println!("{dims:?} -> {}x{} orientation {orient:?}", img.width(), img.height());
         if let Ok(out) = std::env::var("PICVIEW_OUT") {
             img.save(out).unwrap();
         }

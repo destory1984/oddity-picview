@@ -38,11 +38,60 @@ pub fn media_kind(path: &Path) -> Option<Media> {
     }
 }
 
+/// Read through Windows Imaging Component (HEIF / Raw image extensions).
+pub const WIC_EXTS: &[&str] = &[
+    "heic", "heif", "avif", // HEIF family
+    "dng", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "orf", "rw2", "raf", "pef", "srw", "3fr",
+    "erf", "kdc", "mrw", "x3f", "raw", "iiq", "mos", // camera RAW
+];
+
+pub fn is_wic(path: &Path) -> bool {
+    ext_in(path, WIC_EXTS)
+}
+
 pub fn is_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| IMG_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x)))
-        .unwrap_or(false)
+    ext_in(path, IMG_EXTS) || is_wic(path)
+}
+
+/// Rotate / mirror decoded pixels by an EXIF orientation value.
+pub fn orient(img: RgbaImage, dims: [u32; 2], o: Option<u8>) -> (RgbaImage, [u32; 2]) {
+    match o.filter(|&v| v > 1).and_then(image::metadata::Orientation::from_exif) {
+        Some(or) => {
+            let mut d = DynamicImage::ImageRgba8(img);
+            d.apply_orientation(or);
+            let swapped = matches!(o, Some(5..=8));
+            (d.to_rgba8(), if swapped { [dims[1], dims[0]] } else { dims })
+        }
+        None => (img, dims),
+    }
+}
+
+/// All frames of an animated GIF with their display times, scaled to fit
+/// `max_side`. None for a still GIF, or one too big to keep in memory.
+pub fn load_gif_frames(path: &Path, max_side: u32) -> Option<Vec<(RgbaImage, std::time::Duration)>> {
+    use image::AnimationDecoder;
+    const MAX_BYTES: usize = 512 * 1024 * 1024;
+    let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let dec = image::codecs::gif::GifDecoder::new(file).ok()?;
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for f in dec.into_frames() {
+        let f = f.ok()?;
+        let (n, d) = f.delay().numer_denom_ms();
+        let ms = if d == 0 { 0 } else { n / d };
+        // browsers treat 0-10ms frames as 100ms; so do we
+        let ms = if ms <= 10 { 100 } else { ms };
+        let mut img = f.into_buffer();
+        if img.width() > max_side || img.height() > max_side {
+            img = DynamicImage::ImageRgba8(img).resize(max_side, max_side, image::imageops::FilterType::Triangle).to_rgba8();
+        }
+        bytes += img.as_raw().len();
+        if bytes > MAX_BYTES {
+            return None;
+        }
+        out.push((img, std::time::Duration::from_millis(ms as u64)));
+    }
+    (out.len() > 1).then_some(out)
 }
 
 /// Raw EXIF Orientation value (1..=8), if the file has one.
@@ -118,4 +167,41 @@ pub fn load_full(path: &Path, max_side: u32) -> Result<(RgbaImage, [u32; 2]), St
         img = img.resize(max_side, max_side, image::imageops::FilterType::Triangle);
     }
     Ok((img.to_rgba8(), dims))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn animated_gif_frames() {
+        // two 4x4 frames, 50ms and 0ms (0 must become 100ms)
+        use image::codecs::gif::GifEncoder;
+        use image::{Delay, Frame, Rgba, RgbaImage};
+        let dir = std::env::temp_dir().join(format!("oddity-gif-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.gif");
+        {
+            let f = std::fs::File::create(&p).unwrap();
+            let mut enc = GifEncoder::new(f);
+            let a = Frame::from_parts(RgbaImage::from_pixel(4, 4, Rgba([255, 0, 0, 255])), 0, 0, Delay::from_numer_denom_ms(50, 1));
+            let b = Frame::from_parts(RgbaImage::from_pixel(4, 4, Rgba([0, 0, 255, 255])), 0, 0, Delay::from_numer_denom_ms(0, 1));
+            enc.encode_frames(vec![a, b]).unwrap();
+        }
+        let frames = super::load_gif_frames(&p, 1024).expect("animated");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].1.as_millis(), 50);
+        assert_eq!(frames[1].1.as_millis(), 100);
+        assert_eq!(frames[1].0.get_pixel(0, 0)[2], 255);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PICVIEW_GIF=<file> cargo test --release real_gif -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn real_gif() {
+        let p = std::env::var("PICVIEW_GIF").unwrap();
+        let t = std::time::Instant::now();
+        let f = super::load_gif_frames(std::path::Path::new(&p), 4096).expect("animated");
+        let total: u128 = f.iter().map(|x| x.1.as_millis()).sum();
+        println!("{} frames, {}x{}, {} ms loop, decoded in {:?}", f.len(), f[0].0.width(), f[0].0.height(), total, t.elapsed());
+    }
 }
