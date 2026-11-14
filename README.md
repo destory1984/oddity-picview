@@ -111,6 +111,14 @@ PICVIEW_BENCH_DIR=C:\Users\me\Pictures cargo test --release bench -- --ignored -
 - 처음 실행할 때 "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행**을 누른다. 코드 서명을 하지 않은 프로그램이라 인터넷에서 받은 exe에 윈도우가 띄우는 경고다. 직접 빌드한 exe에는 뜨지 않는다.
 - HEIC, RAW를 보려면 Microsoft Store에서 "HEIF 이미지 확장", "Raw 이미지 확장"을 설치한다.
 
+경고 창 없이 받으려면, 명령 프롬프트나 PowerShell에서 curl로 받는다. curl은 윈도우 10, 11에 기본으로 들어 있다.
+
+```
+curl -LO https://github.com/destory1984/oddity-picview/releases/latest/download/oddity-picview.exe
+```
+
+브라우저는 받은 파일에 "인터넷에서 받음" 표시를 붙이고, 윈도우는 이 표시가 있는 서명 없는 exe에 경고를 띄운다. curl은 이 표시를 붙이지 않는다. 경고만 안 뜰 뿐 파일은 같다.
+
 ## 빌드
 
 ```
