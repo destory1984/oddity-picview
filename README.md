@@ -104,6 +104,13 @@ PICVIEW_BENCH_DIR=C:\Users\me\Pictures cargo test --release bench -- --ignored -
 - 썸네일 왼쪽 아래에 동영상은 ▶, 음성은 ♪ 표시가 붙는다.
 - 두 번 누르거나 Enter를 누르면 윈도우 기본 프로그램으로 연다.
 
+## 내려받기
+
+[Releases](https://github.com/destory1984/oddity-picview/releases) 에서 `oddity-picview.exe` 를 받아 실행한다. 설치는 없다.
+
+- 처음 실행할 때 "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행**을 누른다. 코드 서명을 하지 않은 프로그램이라 인터넷에서 받은 exe에 윈도우가 띄우는 경고다. 직접 빌드한 exe에는 뜨지 않는다.
+- HEIC, RAW를 보려면 Microsoft Store에서 "HEIF 이미지 확장", "Raw 이미지 확장"을 설치한다.
+
 ## 빌드
 
 ```
