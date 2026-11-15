@@ -213,6 +213,8 @@ struct Settings {
     cache_max_mb: u64,
     /// ask before sending files to the recycle bin
     confirm_delete: bool,
+    /// make and play 10-frame video previews
+    video_preview: bool,
 }
 
 impl Default for Settings {
@@ -227,6 +229,7 @@ impl Default for Settings {
             transfer_dirs: Vec::new(),
             cache_max_mb: cache::DEFAULT_MAX_MB,
             confirm_delete: true,
+            video_preview: true,
         }
     }
 }
@@ -324,6 +327,8 @@ struct App {
     dnd_target: Option<PathBuf>,
     cache_max_mb: u64,
     confirm_delete: bool,
+    /// settings: video previews on / off
+    video_preview: bool,
     show_settings: bool,
     show_about: bool,
     /// bytes in the thumbnail cache, measured in the background (u64::MAX = not yet)
@@ -407,6 +412,7 @@ impl App {
             dnd_target: None,
             cache_max_mb: saved.cache_max_mb.clamp(CACHE_MIN_MB, CACHE_MAX_MB),
             confirm_delete: saved.confirm_delete,
+            video_preview: saved.video_preview,
             show_settings: false,
             show_about: false,
             cache_usage: Arc::new(AtomicU64::new(u64::MAX)),
@@ -844,6 +850,9 @@ impl App {
 
     /// Current frame of the video preview of `p`, if it is ready.
     fn clip_frame(&self, p: &Path) -> Option<(TextureHandle, usize)> {
+        if !self.video_preview {
+            return None;
+        }
         match self.clips.get(p)? {
             Clip::Ready(a) => self.anim_pick(a),
             _ => None,
@@ -852,6 +861,9 @@ impl App {
 
     /// Start making the video preview of entry `i` (from the disk cache if it is there).
     fn request_clip(&mut self, i: usize) {
+        if !self.video_preview {
+            return;
+        }
         let Some(e) = self.entries.get(i).filter(|e| e.media == Some(loader::Media::Video)) else { return };
         let path = e.path.clone();
         if let Some(pos) = self.clip_order.iter().position(|p| p == &path) {
@@ -2772,6 +2784,10 @@ impl App {
                 v.widgets.hovered.weak_bg_fill = hover;
                 v.widgets.active.weak_bg_fill = C::from_rgb(212, 231, 252);
                 v.widgets.open.weak_bg_fill = hover;
+                // short windows: scroll the sections instead of cutting them off
+                let max_h = (ctx.screen_rect().height() - 120.0).max(200.0);
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid(); // a bar you can see
+                egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
                 Frame::new().fill(C::from_rgb(248, 250, 252))
                     .stroke(Stroke::new(1.0f32, line)).corner_radius(CornerRadius::same(6))
                     .inner_margin(14).show(ui, |ui| {
@@ -2781,8 +2797,11 @@ impl App {
                             ui.label(RichText::new("썸네일 캐시").size(15.0).strong());
                         });
                         ui.add(egui::Label::new(RichText::new(
-                            "목록의 작은 그림을 디스크에 저장해 두고, 폴더를 다시 열 때 바로 보여 줍니다. \
-                             그림 100장에 2MB쯤 듭니다. 비워도 원본은 그대로이고 다시 만듭니다."
+                            "목록의 작은 그림(썸네일)은 원본을 열어 줄여야 해서 시간이 듭니다. \
+                             그래서 한 번 만든 것을 디스크에 저장해 두고, 폴더를 다시 열 때 읽어 씁니다. \
+                             그림 127장 폴더에서 새로 만들면 0.20초, 저장한 것을 읽으면 0.02초였고, \
+                             큰 사진이 많을수록 차이가 커집니다. 100장에 2MB쯤 들며, \
+                             비워도 원본은 그대로이고 다음에 볼 때 다시 만듭니다."
                         ).size(12.0).color(muted)).wrap());
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -2867,6 +2886,21 @@ impl App {
                             "어느 쪽이든 휴지통으로 가므로 되살릴 수 있습니다."
                         ).size(12.0).color(muted)).wrap());
                     });
+                // video previews: on / off
+                Frame::new().fill(C::from_rgb(248, 250, 252))
+                    .stroke(Stroke::new(1.0f32, line)).corner_radius(CornerRadius::same(6))
+                    .inner_margin(14).show(ui, |ui| {
+                        ui.set_width(390.0);
+                        ui.horizontal(|ui| {
+                            ui.image((self.icons.view.id(), vec2(16.0, 16.0)));
+                            ui.label(RichText::new("동영상 미리보기").size(15.0).strong());
+                        });
+                        ui.separator();
+                        ui.checkbox(&mut self.video_preview, "동영상에서 10장을 뽑아 돌려 보여 주기");
+                        ui.add(egui::Label::new(RichText::new(
+                            "미리보기 칸, 그리고 마우스를 올린 목록 칸에서 돕니다. 끄면 썸네일 한 장만 보입니다."
+                        ).size(12.0).color(muted)).wrap());
+                    });
                 // program info lives in its own small window
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     let image = egui::Image::new((self.icons.view.id(), vec2(16.0, 16.0)));
@@ -2874,6 +2908,7 @@ impl App {
                         self.show_about = true;
                     }
                 });
+                }); // ScrollArea
             });
         // Esc goes back to the main screen (the About window on top closes first)
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
@@ -3126,6 +3161,7 @@ impl eframe::App for App {
             transfer_dirs: self.transfer_dirs.clone(),
             cache_max_mb: self.cache_max_mb,
             confirm_delete: self.confirm_delete,
+            video_preview: self.video_preview,
         };
         eframe::set_value(storage, eframe::APP_KEY, &s);
     }
