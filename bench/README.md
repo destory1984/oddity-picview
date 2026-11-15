@@ -22,3 +22,7 @@ python bench/time_to_thumbnails.py target/release/oddity-picview.exe bench/photo
 ```
 
 [bench/time_to_thumbnails.py](bench/time_to_thumbnails.py) 는 클릭이나 키 입력 없이 창만 찍어서 재므로, 소스를 볼 수 없는 프로그램에도 쓸 수 있다. 세 번째 인자는 지켜볼 썸네일 칸의 위치(창 크기 대비 0 → 1)다. 알씨는 폴더를 인자로 넘기면 크게보기로 열리므로, 마지막으로 연 폴더를 다시 여는 `-` 로 실행했다.
+
+## 화면 찍기
+
+[capture.py](capture.py) 는 뷰어를 띄워 2초 뒤 창을 두 번 찍는다. 클릭이나 키 입력을 보내지 않으므로 다른 사람이 PC를 쓰는 중에도 돌려도 된다. 설정 창이나 메뉴를 열어 찍는 환경변수는 파일 맨 위에 적혀 있다.
