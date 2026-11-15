@@ -2522,9 +2522,14 @@ impl App {
                             ui.image((self.icons.settings.id(), vec2(16.0, 16.0)));
                             ui.label(RichText::new("썸네일 캐시").size(15.0).strong());
                         });
+                        ui.add(egui::Label::new(RichText::new(
+                            "목록의 작은 그림을 디스크에 저장해 두고, 폴더를 다시 열 때 바로 보여 줍니다. \
+                             그림 100장에 2MB쯤 듭니다. 비워도 원본은 그대로이고 다시 만듭니다."
+                        ).size(12.0).color(muted)).wrap());
                         ui.separator();
-                        ui.label("최대 크기");
                         ui.horizontal(|ui| {
+                            ui.label("최대 크기");
+                            ui.spacing_mut().slider_width = 220.0;
                             ui.add(egui::Slider::new(&mut self.cache_max_mb,
                                 CACHE_MIN_MB..=CACHE_MAX_MB).show_value(false));
                             ui.scope(|ui| {
