@@ -352,3 +352,107 @@ pub fn media_duration(path: &Path) -> Option<std::time::Duration> {
         (hns > 0).then(|| std::time::Duration::from_nanos(hns * 100))
     }
 }
+
+/// `n` frames spread over a video (at 5%, 15%, ... 95% of its length), each
+/// scaled to `width` pixels wide. Uses Windows' own decoders (Media
+/// Foundation), so it reads what the Films & TV app reads. Run on a worker thread.
+pub fn video_frames(path: &Path, n: usize, width: u32) -> Result<Vec<image::RgbaImage>, String> {
+    use windows::core::{GUID, PCWSTR};
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Variant::VT_I8;
+    use windows::Win32::Media::MediaFoundation::*;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
+    let fixed = PathBuf::from(path.to_string_lossy().replace('/', "\\"));
+    let wpath = wide(fixed.as_os_str());
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET).map_err(|e| e.to_string())?;
+        let res = (|| -> windows::core::Result<Vec<image::RgbaImage>> {
+            let mut attrs: Option<IMFAttributes> = None;
+            MFCreateAttributes(&mut attrs, 2)?;
+            let attrs = attrs.ok_or_else(windows::core::Error::empty)?;
+            // the reader converts to RGB32 and scales down itself (much cheaper than
+            // converting full-size frames), and may use the GPU's video decoder
+            attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
+            attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+            let reader = MFCreateSourceReaderFromURL(PCWSTR(wpath.as_ptr()), &attrs)?;
+            let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+            reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
+            reader.SetStreamSelection(stream, true)?;
+            let native = reader.GetNativeMediaType(stream, 0)?;
+            let ns = native.GetUINT64(&MF_MT_FRAME_SIZE)?;
+            let (nw, nh) = ((ns >> 32) as u32, (ns & 0xffff_ffff) as u32);
+            let want = MFCreateMediaType()?;
+            want.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+            want.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)?;
+            if nw > width && nh > 0 {
+                let h = ((width as u64 * nh as u64) / nw as u64).max(2) as u32 & !1;
+                want.SetUINT64(&MF_MT_FRAME_SIZE, ((width as u64) << 32) | h as u64)?;
+            }
+            reader.SetCurrentMediaType(stream, None, &want)?;
+            let cur = reader.GetCurrentMediaType(stream)?;
+            let fs = cur.GetUINT64(&MF_MT_FRAME_SIZE)?;
+            let (fw, fh) = ((fs >> 32) as u32, (fs & 0xffff_ffff) as u32);
+            if fw == 0 || fh == 0 {
+                return Err(windows::core::Error::empty());
+            }
+            let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(fw as i32 * 4);
+            let dur_pv = reader.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)?;
+            let dur = dur_pv.Anonymous.Anonymous.Anonymous.uhVal; // VT_UI8, 100 ns units
+            let height = ((width as u64 * fh as u64) / fw as u64).max(1) as u32;
+
+            let mut out = Vec::new();
+            for k in 0..n {
+                let mut at = 0i64;
+                if dur > 0 {
+                    at = (dur as f64 * (k as f64 + 0.5) / n as f64) as i64;
+                    let mut pos = PROPVARIANT::default();
+                    (*pos.Anonymous.Anonymous).vt = VT_I8;
+                    (*pos.Anonymous.Anonymous).Anonymous.hVal = at;
+                    reader.SetCurrentPosition(&GUID::zeroed(), &pos)?;
+                }
+                // seeking lands on the keyframe before `at`: decode forward until
+                // the frame at `at` (at most 400 frames, about 15 s of 25 fps video)
+                let mut sample: Option<IMFSample> = None;
+                for _ in 0..400 {
+                    let mut flags = 0u32;
+                    let mut ts = 0i64;
+                    let mut got: Option<IMFSample> = None;
+                    reader.ReadSample(stream, 0, None, Some(&mut flags), Some(&mut ts), Some(&mut got))?;
+                    if got.is_some() {
+                        sample = got;
+                    }
+                    if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 || (sample.is_some() && ts >= at) {
+                        break;
+                    }
+                }
+                let Some(sample) = sample else { break };
+                let buf = sample.ConvertToContiguousBuffer()?;
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                let mut len = 0u32;
+                buf.Lock(&mut ptr, None, Some(&mut len))?;
+                let data = std::slice::from_raw_parts(ptr, len as usize);
+                let row = stride.unsigned_abs() as usize;
+                let mut img = image::RgbaImage::new(fw, fh);
+                for y in 0..fh as usize {
+                    // negative stride = bottom-up rows
+                    let src_y = if stride < 0 { fh as usize - 1 - y } else { y };
+                    let Some(src) = data.get(src_y * row..src_y * row + fw as usize * 4) else { break };
+                    for (x, px) in src.chunks_exact(4).enumerate() {
+                        img.put_pixel(x as u32, y as u32, image::Rgba([px[2], px[1], px[0], 255])); // BGRX
+                    }
+                }
+                let _ = buf.Unlock();
+                out.push(image::imageops::resize(&img, width, height, image::imageops::FilterType::Triangle));
+            }
+            Ok(out)
+        })();
+        let _ = MFShutdown();
+        match res {
+            Ok(v) if !v.is_empty() => Ok(v),
+            Ok(_) => Err("프레임이 없습니다".into()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}

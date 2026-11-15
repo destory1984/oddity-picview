@@ -70,6 +70,14 @@ const MAX_THUMBS_LOADED: usize = 800;
 const BIG_CACHE: usize = 8;
 const SCROLL_ANIM: Duration = Duration::from_millis(120);
 const PREVIEW_DELAY: Duration = Duration::from_millis(120);
+/// Video preview: frames taken over the whole length, shown in a loop.
+const CLIP_FRAMES: usize = 10;
+const CLIP_W: u32 = 400;
+const CLIP_FRAME_TIME: Duration = Duration::from_millis(700);
+/// How long the pointer must rest on a video thumbnail before it plays.
+const CLIP_HOVER: Duration = Duration::from_millis(300);
+/// Video previews kept in memory (10 textures each).
+const CLIP_CACHE: usize = 24;
 
 // ---------------------------------------------------------------- data types
 
@@ -142,6 +150,8 @@ enum Msg {
     Rotated { path: PathBuf, turns: i32, res: Result<(), String> },
     /// frames of an animated GIF, sent after its first frame (`Big`)
     Anim { path: PathBuf, frames: Vec<(TextureHandle, Duration)> },
+    /// video preview frames (None: Windows could not decode it)
+    Clip { path: PathBuf, frames: Option<Vec<TextureHandle>> },
     OpDone { status: String, dirs: Vec<PathBuf>, clear_clipboard: bool },
 }
 
@@ -226,6 +236,13 @@ struct Anim {
     frames: Vec<(TextureHandle, Duration)>,
     total: Duration,
     start: Instant,
+}
+
+/// Video preview: frames over the whole video, looped like a GIF.
+enum Clip {
+    Pending,
+    Ready(Anim),
+    Failed,
 }
 
 struct Viewer {
@@ -313,6 +330,11 @@ struct App {
     cache_usage: Arc<AtomicU64>,
     /// audio preview (Space on a sound file); stops when the focus moves
     player: Option<audio::Player>,
+    /// video previews by path, most recently used last in `clip_order`
+    clips: HashMap<PathBuf, Clip>,
+    clip_order: VecDeque<PathBuf>,
+    /// video thumbnail under the pointer and since when
+    clip_hover: Option<(usize, Instant)>,
     /// file kind shown in the list (address bar buttons)
     kind_filter: KindFilter,
     /// files of each kind in the folder before filtering: all, image, video, audio
@@ -389,6 +411,9 @@ impl App {
             show_about: false,
             cache_usage: Arc::new(AtomicU64::new(u64::MAX)),
             player: None,
+            clips: HashMap::new(),
+            clip_order: VecDeque::new(),
+            clip_hover: None,
             kind_filter: KindFilter::All,
             kind_counts: [0; 4],
             recent: saved.recent.into_iter().filter(|p| p.is_dir()).take(RECENT_MAX).collect(),
@@ -634,7 +659,7 @@ impl App {
         if playing {
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
-        ui.weak("Space: 재생 / 일시정지 · 두 번 누르면 기본 프로그램으로 엽니다");
+        ui.weak("Space: 재생 / 일시정지 · 더블 클릭하면 기본 프로그램으로 엽니다");
     }
 
     fn open_entry(&mut self, i: usize) {
@@ -798,19 +823,80 @@ impl App {
 
     /// Frame of the animated GIF `p` to show now, scheduling the next repaint.
     fn anim_frame(&self, p: &Path) -> Option<TextureHandle> {
-        let a = self.anims.get(p)?;
+        self.anim_pick(self.anims.get(p)?).map(|f| f.0)
+    }
+
+    /// Frame of `a` to show now and its number, scheduling the next repaint.
+    fn anim_pick(&self, a: &Anim) -> Option<(TextureHandle, usize)> {
         if a.total.is_zero() {
             return None;
         }
         let mut t = Duration::from_nanos((a.start.elapsed().as_nanos() % a.total.as_nanos()) as u64);
-        for (tex, d) in &a.frames {
+        for (k, (tex, d)) in a.frames.iter().enumerate() {
             if t < *d {
                 self.ctx.request_repaint_after(*d - t);
-                return Some(tex.clone());
+                return Some((tex.clone(), k));
             }
             t -= *d;
         }
-        a.frames.last().map(|f| f.0.clone())
+        a.frames.last().map(|f| (f.0.clone(), a.frames.len() - 1))
+    }
+
+    /// Current frame of the video preview of `p`, if it is ready.
+    fn clip_frame(&self, p: &Path) -> Option<(TextureHandle, usize)> {
+        match self.clips.get(p)? {
+            Clip::Ready(a) => self.anim_pick(a),
+            _ => None,
+        }
+    }
+
+    /// Start making the video preview of entry `i` (from the disk cache if it is there).
+    fn request_clip(&mut self, i: usize) {
+        let Some(e) = self.entries.get(i).filter(|e| e.media == Some(loader::Media::Video)) else { return };
+        let path = e.path.clone();
+        if let Some(pos) = self.clip_order.iter().position(|p| p == &path) {
+            let p = self.clip_order.remove(pos).unwrap();
+            self.clip_order.push_back(p);
+            return;
+        }
+        self.clips.insert(path.clone(), Clip::Pending);
+        self.clip_order.push_back(path.clone());
+        while self.clip_order.len() > CLIP_CACHE {
+            if let Some(old) = self.clip_order.pop_front() {
+                self.clips.remove(&old);
+            }
+        }
+        let (size, modified) = (e.size, e.modified);
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            // cached as one strip of frames side by side, under its own key
+            let key = PathBuf::from(format!("{}#clip{CLIP_FRAMES}", path.display()));
+            let frames: Option<Vec<image::RgbaImage>> = match cache::load(&key, size, modified) {
+                Some(strip) if strip.width() >= CLIP_W => {
+                    let n = (strip.width() / CLIP_W) as usize;
+                    Some((0..n).map(|k| image::imageops::crop_imm(&strip, k as u32 * CLIP_W, 0, CLIP_W, strip.height()).to_image()).collect())
+                }
+                _ => fileops::video_frames(&path, CLIP_FRAMES, CLIP_W).ok().inspect(|v| {
+                    let h = v[0].height();
+                    let mut strip = image::RgbaImage::new(CLIP_W * v.len() as u32, h);
+                    for (k, f) in v.iter().enumerate() {
+                        image::imageops::replace(&mut strip, f, k as i64 * CLIP_W as i64, 0);
+                    }
+                    cache::store(&key, size, modified, &strip);
+                }),
+            };
+            let frames = frames.map(|v| {
+                v.into_iter()
+                    .enumerate()
+                    .map(|(k, img)| {
+                        let ci = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                        ctx.load_texture(format!("{}#clip{k}", path.display()), ci, tex_opts())
+                    })
+                    .collect()
+            });
+            let _ = tx.send(Msg::Clip { path, frames });
+            ctx.request_repaint();
+        });
     }
 
     /// Rotation to draw `tex` of file `p` with: turns not yet in the file,
@@ -1014,6 +1100,19 @@ impl App {
                     }
                 }
                 Msg::Rotated { path, turns, res } => self.on_rotated(path, turns, res),
+                Msg::Clip { path, frames } => {
+                    if self.clips.contains_key(&path) {
+                        let clip = match frames {
+                            Some(f) if !f.is_empty() => {
+                                let frames: Vec<_> = f.into_iter().map(|t| (t, CLIP_FRAME_TIME)).collect();
+                                let total = CLIP_FRAME_TIME * frames.len() as u32;
+                                Clip::Ready(Anim { frames, total, start: Instant::now() })
+                            }
+                            _ => Clip::Failed,
+                        };
+                        self.clips.insert(path, clip);
+                    }
+                }
                 Msg::Anim { path, frames } => {
                     if self.big.contains_key(&path) {
                         let total = frames.iter().map(|f| f.1).sum();
@@ -1534,7 +1633,7 @@ impl App {
                 .or_insert_with(|| list_subdirs(path))
                 .clone();
             if kids.is_empty() {
-                ui.weak("(비어 있음)");
+                ui.weak("(하위 폴더 없음)");
             }
             for k in kids {
                 let name = k.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1961,14 +2060,7 @@ impl App {
     }
 
     fn grid(&mut self, ui: &mut Ui) {
-        // blank area: clicking clears the selection, right-click opens the folder menu.
-        // Cells are registered later, so they get their own clicks first.
-        let bg = ui.interact(ui.max_rect(), Id::new("grid_bg"), Sense::click());
-        if bg.clicked() {
-            self.selected.clear();
-        }
-        let dir = self.cur_dir.clone();
-        bg.context_menu(|ui| self.file_menu(ui, Vec::new(), dir.clone()));
+        // empty folder: the whole panel is blank area (see `blank_area`)
         let n = self.entries.len();
         let off = self.slot_off();
         if n + off == 0 {
@@ -1976,6 +2068,8 @@ impl App {
                 KindFilter::All => "그림이 없습니다".to_string(),
                 f => format!("이 폴더에 {}이 없습니다", f.label()),
             };
+            let r = ui.max_rect();
+            self.blank_area(ui, r);
             ui.centered_and_justified(|ui| ui.weak(msg));
             return;
         }
@@ -2004,6 +2098,9 @@ impl App {
         let out = sa.show_viewport(ui, |ui, vp| {
             ui.set_height(lay.total_h);
             let origin = ui.max_rect().min;
+            // blank area under the cells, registered first so the cells sit on top of it
+            let blank = Rect::from_min_size(origin, vec2(avail, lay.total_h.max(vp.height())));
+            self.blank_area(ui, blank);
             if let Some(y) = lay.split_y {
                 let y = origin.y + y;
                 ui.painter().hline(origin.x..=origin.x + avail, y, Stroke::new(1.0f32, Color32::from_gray(215)));
@@ -2041,6 +2138,17 @@ impl App {
         });
         self.grid_offset = out.state.offset.y;
         self.grid_view_h = out.inner_rect.height();
+    }
+
+    /// Blank part of the list: a click clears the selection, a right-click opens
+    /// the folder menu (new folder, paste, refresh, properties...).
+    fn blank_area(&mut self, ui: &mut Ui, rect: Rect) {
+        let bg = ui.interact(rect, Id::new("grid_bg"), Sense::click());
+        if bg.clicked() {
+            self.selected.clear();
+        }
+        let dir = self.cur_dir.clone();
+        bg.context_menu(|ui| self.file_menu(ui, Vec::new(), dir.clone()));
     }
 
     /// One wheel notch scrolls exactly one row of thumbnails.
@@ -2181,7 +2289,33 @@ impl App {
             let fr = Rect::from_center_size(img_area.center(), img_area.size() * 0.60);
             painter.image(self.icons.folder.id(), fr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         } else {
+            // video under the pointer: after a short rest, play its preview frames
+            let mut clip = None;
+            if e.media == Some(loader::Media::Video) && resp.hovered() {
+                match self.clip_hover {
+                    Some((h, since)) if h == i => {
+                        if since.elapsed() >= CLIP_HOVER {
+                            let path = e.path.clone();
+                            self.request_clip(i);
+                            clip = self.clip_frame(&path);
+                        } else {
+                            ui.ctx().request_repaint_after(CLIP_HOVER - since.elapsed());
+                        }
+                    }
+                    _ => {
+                        self.clip_hover = Some((i, Instant::now()));
+                        ui.ctx().request_repaint_after(CLIP_HOVER);
+                    }
+                }
+            }
+            let e = &self.entries[i];
+            let painter = ui.painter();
             match &self.thumbs[i] {
+                _ if clip.is_some() => {
+                    let (t, k) = clip.unwrap();
+                    draw_image(ui, &t, t.size_vec2(), img_area, 0, None, Vec2::ZERO);
+                    clip_progress(ui, img_area, t.size_vec2(), k);
+                }
                 Thumb::Ready(t) => {
                     draw_image(ui, t, t.size_vec2(), img_area, self.disp_rot(&e.path, t), None, Vec2::ZERO);
                 }
@@ -2202,6 +2336,7 @@ impl App {
             }
         }
 
+        let e = &self.entries[i];
         let mut job = LayoutJob::single_section(
             e.name.clone(),
             TextFormat { font_id: FontId::proportional(13.0), color: Color32::from_gray(30), ..Default::default() },
@@ -2288,7 +2423,20 @@ impl App {
             let reserve = if m == loader::Media::Audio { 190.0 } else { 110.0 };
             let area_h = (ui.available_height() - reserve).max(60.0);
             let (area, resp) = ui.allocate_exact_size(vec2(ui.available_width(), area_h), Sense::click());
-            if let Thumb::Ready(t) = &self.thumbs[i] {
+            if m == loader::Media::Video {
+                // the focus settled on a video: play its preview frames
+                let el = self.focus_time.elapsed();
+                if el >= PREVIEW_DELAY {
+                    self.request_clip(i);
+                } else {
+                    ui.ctx().request_repaint_after(PREVIEW_DELAY - el);
+                }
+            }
+            let e = &self.entries[i];
+            if let Some((t, k)) = self.clip_frame(&e.path) {
+                draw_image(ui, &t, t.size_vec2(), area, 0, None, Vec2::ZERO);
+                clip_progress(ui, area, t.size_vec2(), k);
+            } else if let Thumb::Ready(t) = &self.thumbs[i] {
                 draw_image(ui, t, t.size_vec2(), area, 0, None, Vec2::ZERO);
             }
             ui.add_space(6.0);
@@ -2301,7 +2449,7 @@ impl App {
                 let path = e.path.clone();
                 self.audio_controls(ui, &path);
             } else {
-                ui.weak("두 번 누르면 기본 프로그램으로 엽니다");
+                ui.weak("더블 클릭하면 기본 프로그램으로 엽니다");
             }
             if resp.double_clicked() {
                 self.actions.push(Action::Open(i));
@@ -3014,6 +3162,14 @@ impl eframe::App for App {
                 self.set_kind_filter(f);
             }
         }
+        // PICVIEW_SELECT_VIDEO=1 focuses the first video once it is listed (for screenshots)
+        static VIDEO_PICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var_os("PICVIEW_SELECT_VIDEO").is_some() && !VIDEO_PICKED.load(Ordering::Relaxed) {
+            if let Some(i) = self.entries.iter().position(|e| e.media == Some(loader::Media::Video)) {
+                VIDEO_PICKED.store(true, Ordering::Relaxed);
+                self.select_single(i);
+            }
+        }
         // PICVIEW_PLAY_AUDIO=1 plays the first sound file once it is listed (for screenshots)
         static AUDIO_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if std::env::var_os("PICVIEW_PLAY_AUDIO").is_some() && !AUDIO_STARTED.load(Ordering::Relaxed) {
@@ -3033,6 +3189,19 @@ impl eframe::App for App {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/// Ten short bars under a playing video preview; the current frame is lit.
+fn clip_progress(ui: &Ui, area: Rect, img: Vec2, k: usize) {
+    let shown = Rect::from_center_size(area.center(), img * fit_scale(img, area.size()));
+    let w = (shown.width() - 8.0) / CLIP_FRAMES as f32;
+    let y = shown.bottom() - 6.0;
+    for j in 0..CLIP_FRAMES {
+        let x = shown.left() + 4.0 + j as f32 * w;
+        let r = Rect::from_min_max(pos2(x + 1.0, y), pos2(x + w - 1.0, y + 3.0));
+        let c = if j == k { Color32::WHITE } else { Color32::from_white_alpha(90) };
+        ui.painter().rect_filled(r, 1.0f32, c);
+    }
+}
 
 fn tex_opts() -> TextureOptions {
     TextureOptions { mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR }
