@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
 mod cache;
 mod fileops;
 mod icons;
@@ -44,6 +45,38 @@ struct Entry {
 impl Entry {
     fn is_img(&self) -> bool {
         !self.is_dir && self.media.is_none()
+    }
+}
+
+/// Which kinds of files the list shows. Folders always stay.
+#[derive(Clone, Copy, PartialEq)]
+enum KindFilter {
+    All,
+    Image,
+    Video,
+    Audio,
+}
+
+impl KindFilter {
+    const ALL: [KindFilter; 4] = [KindFilter::All, KindFilter::Image, KindFilter::Video, KindFilter::Audio];
+
+    fn label(self) -> &'static str {
+        match self {
+            KindFilter::All => "전체",
+            KindFilter::Image => "그림",
+            KindFilter::Video => "동영상",
+            KindFilter::Audio => "음성",
+        }
+    }
+
+    fn keeps(self, e: &Entry) -> bool {
+        e.is_dir
+            || match self {
+                KindFilter::All => true,
+                KindFilter::Image => e.is_img(),
+                KindFilter::Video => e.media == Some(loader::Media::Video),
+                KindFilter::Audio => e.media == Some(loader::Media::Audio),
+            }
     }
 }
 
@@ -236,6 +269,12 @@ struct App {
     show_about: bool,
     /// bytes in the thumbnail cache, measured in the background (u64::MAX = not yet)
     cache_usage: Arc<AtomicU64>,
+    /// audio preview (Space on a sound file); stops when the focus moves
+    player: Option<audio::Player>,
+    /// file kind shown in the list (address bar buttons)
+    kind_filter: KindFilter,
+    /// files of each kind in the folder before filtering: all, image, video, audio
+    kind_counts: [usize; 4],
 }
 
 impl App {
@@ -307,6 +346,9 @@ impl App {
             show_settings: false,
             show_about: false,
             cache_usage: Arc::new(AtomicU64::new(u64::MAX)),
+            player: None,
+            kind_filter: KindFilter::All,
+            kind_counts: [0; 4],
             recent: saved.recent.into_iter().filter(|p| p.is_dir()).take(RECENT_MAX).collect(),
         };
 
@@ -337,8 +379,9 @@ impl App {
     // ------------------------------------------------------------ navigation
 
     fn navigate(&mut self, dir: PathBuf, push_history: bool) {
+        self.player = None;
         let dir = normalize(dir);
-        let entries = match list_dir(&dir) {
+        let entries = match self.list_filtered(&dir) {
             Ok(e) => e,
             Err(e) => {
                 self.status = format!("폴더를 열 수 없습니다: {e}");
@@ -368,9 +411,36 @@ impl App {
         self.open_tree_to(&dir);
     }
 
+    /// List a folder, count each kind, and keep only the kind picked in the filter.
+    fn list_filtered(&mut self, dir: &Path) -> std::io::Result<Vec<Entry>> {
+        let mut v = list_dir(dir)?;
+        let files = v.iter().filter(|e| !e.is_dir);
+        self.kind_counts = [0; 4];
+        for e in files {
+            self.kind_counts[0] += 1;
+            for (k, f) in KindFilter::ALL.iter().enumerate().skip(1) {
+                if f.keeps(e) {
+                    self.kind_counts[k] += 1;
+                }
+            }
+        }
+        let f = self.kind_filter;
+        v.retain(|e| f.keeps(e));
+        Ok(v)
+    }
+
+    fn set_kind_filter(&mut self, f: KindFilter) {
+        if self.kind_filter != f {
+            self.kind_filter = f;
+            self.player = None;
+            self.reload(None);
+            self.grid_scroll_to = Some(0.0);
+        }
+    }
+
     /// Re-read the current folder, keeping already made thumbnails.
     fn reload(&mut self, focus_path: Option<PathBuf>) {
-        let Ok(entries) = list_dir(&self.cur_dir) else { return };
+        let Ok(entries) = self.list_filtered(&self.cur_dir.clone()) else { return };
         let mut old: HashMap<PathBuf, TextureHandle> = HashMap::new();
         for (e, t) in self.entries.iter().zip(self.thumbs.drain(..)) {
             if let Thumb::Ready(tex) = t {
@@ -453,6 +523,78 @@ impl App {
         }
     }
 
+    /// Space on a sound file: start, pause or resume the preview.
+    fn audio_toggle(&mut self) {
+        let Some(e) = self.focus.and_then(|i| self.entries.get(i)) else { return };
+        if e.media != Some(loader::Media::Audio) {
+            return;
+        }
+        let path = e.path.clone();
+        let r = match &mut self.player {
+            Some(p) if p.path == path => p.toggle(),
+            _ => audio::Player::start(&path).map(|p| self.player = Some(p)),
+        };
+        if let Err(e) = r {
+            self.player = None;
+            self.status = e;
+        }
+    }
+
+    /// Play button, time and seek bar under the audio preview.
+    fn audio_controls(&mut self, ui: &mut Ui, path: &Path) {
+        let mine = self.player.as_ref().filter(|p| p.path == path);
+        let playing = mine.is_some_and(|p| p.is_playing());
+        let pos = mine.map(|p| p.pos()).unwrap_or_default();
+        let dur = mine.and_then(|p| p.duration);
+        let have = mine.is_some();
+        let mut toggle = false;
+        let mut seek_to: Option<Duration> = None;
+        ui.horizontal(|ui| {
+            let label = if playing { "⏸ 일시정지" } else { "▶ 재생" };
+            let btn = egui::Button::new(egui::RichText::new(label).size(15.0))
+                .min_size(vec2(96.0, 28.0))
+                .fill(if playing { Color32::from_rgb(204, 228, 255) } else { Color32::from_gray(235) });
+            if ui.add(btn).on_hover_text("Space").clicked() {
+                toggle = true;
+            }
+            let t = match dur {
+                Some(d) => format!("{} / {}", audio::fmt_dur(pos), audio::fmt_dur(d)),
+                None => audio::fmt_dur(pos),
+            };
+            ui.monospace(t);
+        });
+        // seek bar: click or drag anywhere on it
+        let (bar, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::click_and_drag());
+        let track = Rect::from_center_size(bar.center(), vec2(bar.width(), 4.0));
+        let painter = ui.painter();
+        painter.rect_filled(track, 2.0f32, Color32::from_gray(210));
+        if let Some(d) = dur.filter(|d| !d.is_zero()) {
+            let frac = (pos.as_secs_f32() / d.as_secs_f32()).clamp(0.0, 1.0);
+            let x = track.left() + track.width() * frac;
+            let done = Rect::from_min_max(track.min, pos2(x, track.max.y));
+            let col = Color32::from_rgb(40, 120, 220);
+            painter.rect_filled(done, 2.0f32, col);
+            let r = if resp.hovered() || resp.dragged() { 6.0 } else { 4.5 };
+            painter.circle_filled(pos2(x, track.center().y), r, col);
+            if have && (resp.clicked() || resp.dragged()) {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let f = ((p.x - track.left()) / track.width()).clamp(0.0, 1.0);
+                    seek_to = Some(d.mul_f32(f));
+                }
+            }
+        }
+        if let (Some(to), Some(p)) = (seek_to, self.player.as_mut()) {
+            p.seek(to);
+        }
+        if toggle {
+            self.audio_toggle();
+        }
+        if playing {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+        ui.weak("Space: 재생 / 일시정지 · 두 번 누르면 기본 프로그램으로 엽니다");
+    }
+
     fn open_entry(&mut self, i: usize) {
         let Some(e) = self.entries.get(i) else { return };
         if e.is_dir {
@@ -501,6 +643,9 @@ impl App {
     // ------------------------------------------------------------ selection
 
     fn set_focus(&mut self, i: usize) {
+        if self.player.as_ref().is_some_and(|p| self.entries.get(i).map(|e| &e.path) != Some(&p.path)) {
+            self.player = None;
+        }
         if self.focus != Some(i) {
             self.focus = Some(i);
             self.focus_time = Instant::now();
@@ -1107,6 +1252,27 @@ impl App {
             self.dnd_target = None;
             return;
         };
+        // pointer left the window with the button still held: hand the files to
+        // Windows so they can be dropped on a browser, Explorer, chat app...
+        let (held, latest) = ctx.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
+        let outside = match latest {
+            Some(p) => !ctx.screen_rect().shrink(2.0).contains(p),
+            None => true,
+        };
+        if held && outside {
+            let files = drag.0.clone();
+            egui::DragAndDrop::clear_payload(ctx);
+            self.dnd_target = None;
+            let n = files.len();
+            match fileops::drag_out(&files) {
+                Ok(0) => {}
+                Ok(_) => self.status = format!("{n}개 항목을 다른 프로그램에 넘겼습니다"),
+                Err(e) => self.status = format!("끌어놓기 실패: {e}"),
+            }
+            fileops::post_left_button_up();
+            ctx.request_repaint();
+            return;
+        }
         let Some(pos) = ctx.pointer_hover_pos() else { return };
         let text = match &self.dnd_target {
             Some(dest) => {
@@ -1340,6 +1506,12 @@ impl App {
             self.actions.push(Action::Refresh(self.cur_dir.clone()));
             return;
         }
+        for (k, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4].into_iter().enumerate() {
+            if mods.command && pressed(key) {
+                self.set_kind_filter(KindFilter::ALL[k]);
+                return;
+            }
+        }
         if mods.command && pressed(Key::N) {
             self.actions.push(Action::NewFolder(self.cur_dir.clone()));
             return;
@@ -1389,6 +1561,9 @@ impl App {
             if let Some(f) = self.focus {
                 self.open_entry(f);
             }
+        }
+        if pressed(Key::Space) {
+            self.audio_toggle();
         }
         if pressed(Key::Delete) {
             self.actions.push(Action::Delete(self.selected_paths()));
@@ -1510,39 +1685,41 @@ impl App {
 
             // sort and size controls, centred on the button row
             ui.allocate_ui_with_layout(
-                vec2(ui.available_width(), 56.0),
+                vec2(ui.available_width(), icons::H),
                 egui::Layout::left_to_right(Align::Center),
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.label("정렬");
                     let before = (self.sort, self.sort_desc);
-                    egui::ComboBox::from_id_salt("sort")
-                        .width(60.0)
-                        .selected_text(match self.sort {
-                            SortKey::Name => "이름",
-                            SortKey::Date => "날짜",
-                            SortKey::Size => "크기",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.sort, SortKey::Name, "이름");
-                            ui.selectable_value(&mut self.sort, SortKey::Date, "날짜");
-                            ui.selectable_value(&mut self.sort, SortKey::Size, "크기");
-                        });
-                    if ui.button(if self.sort_desc { "내림차순" } else { "오름차순" }).clicked() {
-                        self.sort_desc = !self.sort_desc;
-                    }
+                    // two rows: sort key on top, direction below
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.spacing_mut().interact_size.y = 18.0;
+                        ui.spacing_mut().button_padding.y = 0.0;
+                        egui::ComboBox::from_id_salt("sort")
+                            .width(84.0)
+                            .selected_text(match self.sort {
+                                SortKey::Name => "이름순",
+                                SortKey::Date => "날짜순",
+                                SortKey::Size => "크기순",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.sort, SortKey::Name, "이름순");
+                                ui.selectable_value(&mut self.sort, SortKey::Date, "날짜순");
+                                ui.selectable_value(&mut self.sort, SortKey::Size, "크기순");
+                            })
+                            .response
+                            .on_hover_text("정렬 기준");
+                        let dir = egui::Button::new(if self.sort_desc { "↓ 내림차순" } else { "↑ 오름차순" })
+                            .min_size(vec2(88.0, 18.0));
+                        if ui.add(dir).on_hover_text("누르면 순서를 뒤집습니다").clicked() {
+                            self.sort_desc = !self.sort_desc;
+                        }
+                    });
                     if before != (self.sort, self.sort_desc) {
                         self.sort_entries();
                     }
                     ui.separator();
-                    ui.label("크기");
-                    if ui.button(" - ").on_hover_text("작게").clicked() {
-                        self.thumb_size = (self.thumb_size - 16.0).max(64.0);
-                    }
-                    ui.add(egui::Slider::new(&mut self.thumb_size, 64.0..=256.0).show_value(false));
-                    if ui.button(" + ").on_hover_text("크게").clicked() {
-                        self.thumb_size = (self.thumb_size + 16.0).min(256.0);
-                    }
+                    self.kind_filter_buttons(ui);
                 },
             );
         });
@@ -1558,8 +1735,68 @@ impl App {
         });
     }
 
+    /// 전체 / 그림 / 동영상 / 음성 buttons with counts (toolbar).
+    fn kind_filter_buttons(&mut self, ui: &mut Ui) {
+        // two rows (전체 그림 / 동영상 음성) so the toolbar stays narrow
+        let mut picked = None;
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+            ui.spacing_mut().button_padding = vec2(6.0, 0.0);
+            for row in KindFilter::ALL.chunks(2) {
+                ui.horizontal(|ui| {
+                    for f in row {
+                        let k = KindFilter::ALL.iter().position(|x| x == f).unwrap_or(0);
+                        let on = self.kind_filter == *f;
+                        let n = self.kind_counts[k];
+                        let text = egui::RichText::new(format!("{} {n}", f.label())).size(12.0).color(if on {
+                            Color32::WHITE
+                        } else if n == 0 && k > 0 {
+                            Color32::from_gray(160)
+                        } else {
+                            Color32::from_gray(40)
+                        });
+                        let b = egui::Button::new(text)
+                            .min_size(vec2(68.0, 18.0))
+                            .corner_radius(9.0)
+                            .fill(if on { Color32::from_rgb(40, 120, 220) } else { Color32::from_gray(232) });
+                        let tip = match f {
+                            KindFilter::All => "폴더의 파일을 모두 보기 (Ctrl+1)".to_string(),
+                            _ => format!("{}만 보기 (Ctrl+{})", f.label(), k + 1),
+                        };
+                        if ui.add(b).on_hover_text(tip).clicked() {
+                            picked = Some(*f);
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(f) = picked {
+            self.set_kind_filter(f);
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
+            // thumbnail size at the right end, like Explorer's zoom slider
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button(" + ").on_hover_text("크게").clicked() {
+                    self.thumb_size = (self.thumb_size + 16.0).min(256.0);
+                }
+                ui.spacing_mut().slider_width = 110.0;
+                ui.add(egui::Slider::new(&mut self.thumb_size, 64.0..=256.0).show_value(false))
+                    .on_hover_text("썸네일 크기");
+                if ui.small_button(" - ").on_hover_text("작게").clicked() {
+                    self.thumb_size = (self.thumb_size - 16.0).max(64.0);
+                }
+                ui.label("크기");
+                ui.separator();
+                ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| self.status_left(ui));
+            });
+        });
+    }
+
+    fn status_left(&mut self, ui: &mut Ui) {
+        {
             match self.focus_dims {
                 Some([w, h]) => ui.label(format!("{w} x {h}")),
                 None => ui.label("-"),
@@ -1575,11 +1812,19 @@ impl App {
             } else {
                 ui.label(format!("총 {} 개체 (그림 {imgs})", self.entries.len()));
             }
+            if self.kind_filter != KindFilter::All {
+                let hidden = self.kind_counts[0] - self.entries.iter().filter(|e| !e.is_dir).count();
+                ui.separator();
+                ui.colored_label(
+                    Color32::from_rgb(40, 120, 220),
+                    format!("{}만 보는 중 (가린 파일 {hidden}개)", self.kind_filter.label()),
+                );
+            }
             if !self.status.is_empty() {
                 ui.separator();
                 ui.colored_label(Color32::from_rgb(180, 60, 20), &self.status);
             }
-        });
+        }
     }
 
     fn quick_access(&mut self, ui: &mut Ui) {
@@ -1644,7 +1889,11 @@ impl App {
         let n = self.entries.len();
         let off = self.slot_off();
         if n + off == 0 {
-            ui.centered_and_justified(|ui| ui.weak("그림이 없습니다"));
+            let msg = match self.kind_filter {
+                KindFilter::All => "그림이 없습니다".to_string(),
+                f => format!("이 폴더에 {}이 없습니다", f.label()),
+            };
+            ui.centered_and_justified(|ui| ui.weak(msg));
             return;
         }
         let slots = n + off;
@@ -1819,7 +2068,9 @@ impl App {
             }
             if let Some(m) = e.media {
                 let badge = Rect::from_min_size(img_area.left_bottom() - vec2(0.0, 26.0), vec2(30.0, 24.0));
-                painter.rect_filled(badge, 4.0f32, Color32::from_black_alpha(170));
+                let playing = self.player.as_ref().is_some_and(|p| p.path == e.path && p.is_playing());
+                let bg = if playing { Color32::from_rgb(40, 120, 220) } else { Color32::from_black_alpha(170) };
+                painter.rect_filled(badge, 4.0f32, bg);
                 let mark = if m == loader::Media::Video { "▶" } else { "♪" };
                 painter.text(badge.center(), Align2::CENTER_CENTER, mark, FontId::proportional(15.0), Color32::WHITE);
             }
@@ -1908,7 +2159,8 @@ impl App {
             return;
         }
         if let Some(m) = e.media {
-            let area_h = (ui.available_height() - 110.0).max(60.0);
+            let reserve = if m == loader::Media::Audio { 190.0 } else { 110.0 };
+            let area_h = (ui.available_height() - reserve).max(60.0);
             let (area, resp) = ui.allocate_exact_size(vec2(ui.available_width(), area_h), Sense::click());
             if let Thumb::Ready(t) = &self.thumbs[i] {
                 draw_image(ui, t, t.size_vec2(), area, 0, None, Vec2::ZERO);
@@ -1918,7 +2170,13 @@ impl App {
             ui.label(if m == loader::Media::Video { "동영상" } else { "음성" });
             ui.label(fmt_size(e.size));
             ui.label(fmt_time(e.modified));
-            ui.weak("두 번 누르면 기본 프로그램으로 엽니다");
+            if m == loader::Media::Audio {
+                ui.add_space(6.0);
+                let path = e.path.clone();
+                self.audio_controls(ui, &path);
+            } else {
+                ui.weak("두 번 누르면 기본 프로그램으로 엽니다");
+            }
             if resp.double_clicked() {
                 self.actions.push(Action::Open(i));
             }
@@ -2603,6 +2861,28 @@ impl eframe::App for App {
         if std::env::var_os("PICVIEW_SHOW_SETTINGS").is_some() && !SETTINGS_SHOWN.swap(true, Ordering::Relaxed) {
             self.open_settings();
             self.show_about = std::env::var_os("PICVIEW_SHOW_ABOUT").is_some();
+        }
+        // PICVIEW_FILTER=image|video|audio picks the kind filter once at start (for screenshots)
+        static FILTER_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if let Some(v) = std::env::var_os("PICVIEW_FILTER") {
+            if !FILTER_SET.swap(true, Ordering::Relaxed) {
+                let f = match v.to_str() {
+                    Some("image") => KindFilter::Image,
+                    Some("video") => KindFilter::Video,
+                    Some("audio") => KindFilter::Audio,
+                    _ => KindFilter::All,
+                };
+                self.set_kind_filter(f);
+            }
+        }
+        // PICVIEW_PLAY_AUDIO=1 plays the first sound file once it is listed (for screenshots)
+        static AUDIO_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var_os("PICVIEW_PLAY_AUDIO").is_some() && !AUDIO_STARTED.load(Ordering::Relaxed) {
+            if let Some(i) = self.entries.iter().position(|e| e.media == Some(loader::Media::Audio)) {
+                AUDIO_STARTED.store(true, Ordering::Relaxed);
+                self.select_single(i);
+                self.audio_toggle();
+            }
         }
         self.dialogs(ctx);
         self.settings_window(ctx);

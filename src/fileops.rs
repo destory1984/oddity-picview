@@ -281,3 +281,74 @@ mod tests {
         }
     }
 }
+
+/// Hand files to Windows' own drag-and-drop so they can be dropped on other
+/// programs (browser, Explorer, chat apps). Blocks until the drop ends; call on
+/// the UI thread (winit has already set it up for OLE). Returns the effect the
+/// target chose: 0 = cancelled, 1 = copy, 2 = move, 4 = link.
+pub fn drag_out(paths: &[PathBuf]) -> Result<u32, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::IDataObject;
+    use windows::Win32::System::Ole::{DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        BHID_DataObject, ILCreateFromPathW, ILFree, IShellItemArray, SHCreateShellItemArrayFromIDLists, SHDoDragDrop,
+    };
+    use windows::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+
+    let mut pidls: Vec<*const ITEMIDLIST> = Vec::new();
+    for p in paths {
+        let fixed = PathBuf::from(p.to_string_lossy().replace('/', "\\"));
+        let w = wide(fixed.as_os_str());
+        let pidl = unsafe { ILCreateFromPathW(PCWSTR(w.as_ptr())) };
+        if !pidl.is_null() {
+            pidls.push(pidl);
+        }
+    }
+    if pidls.is_empty() {
+        return Err("끌 파일이 없습니다".into());
+    }
+    let result = unsafe {
+        (|| -> windows::core::Result<u32> {
+            let items: IShellItemArray = SHCreateShellItemArrayFromIDLists(&pidls)?;
+            let data: IDataObject = items.BindToHandler(None, &BHID_DataObject)?;
+            // copy or link only: a browser or chat app must never "move" (delete) the original
+            let hwnd = HWND(GetActiveWindow());
+            let effect: DROPEFFECT = SHDoDragDrop(Some(hwnd), &data, None, DROPEFFECT_COPY | DROPEFFECT_LINK)?;
+            Ok(effect.0)
+        })()
+    };
+    for p in pidls {
+        unsafe { ILFree(Some(p)) };
+    }
+    result.map_err(|e| e.to_string())
+}
+
+/// After an OLE drag loop the window never sees the left button come up, so
+/// egui would think it is still held. Post the release ourselves.
+pub fn post_left_button_up() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_LBUTTONUP};
+    unsafe {
+        let h = GetActiveWindow();
+        if !h.is_null() {
+            PostMessageW(h, WM_LBUTTONUP, 0, 0);
+        }
+    }
+}
+
+/// Play length as Explorer shows it (the "길이" column). More exact than the
+/// decoder's guess for MP3s, which estimates from the bitrate.
+pub fn media_duration(path: &Path) -> Option<std::time::Duration> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::EnhancedStorage::PKEY_Media_Duration;
+    use windows::Win32::UI::Shell::{IShellItem2, SHCreateItemFromParsingName};
+    let fixed = PathBuf::from(path.to_string_lossy().replace('/', "\\"));
+    let w = wide(fixed.as_os_str());
+    unsafe {
+        let item: IShellItem2 = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok()?;
+        let hns = item.GetUInt64(&PKEY_Media_Duration).ok()?; // 100 ns units
+        (hns > 0).then(|| std::time::Duration::from_nanos(hns * 100))
+    }
+}

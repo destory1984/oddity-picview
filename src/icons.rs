@@ -43,15 +43,15 @@ impl Icons {
     }
 }
 
-pub const ICON: f32 = 30.0;
-const H: f32 = 56.0;
+pub const ICON: f32 = 20.0;
+pub const H: f32 = 40.0;
 
 /// Toolbar button: icon on top, label below. Hover lights it up, pressing pushes
 /// the icon down a little so the click is felt; disabled ones are greyed out.
 pub fn tool_button(ui: &mut Ui, icon: &TextureHandle, label: &str, enabled: bool) -> Response {
-    let font = FontId::proportional(12.5);
+    let font = FontId::proportional(11.5);
     let text_w = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font.clone(), Color32::BLACK).size().x);
-    let w = (text_w + 14.0).max(48.0);
+    let w = (text_w + 6.0).max(34.0);
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(vec2(w, H), sense);
     if !ui.is_rect_visible(rect) {
@@ -69,11 +69,11 @@ pub fn tool_button(ui: &mut Ui, icon: &TextureHandle, label: &str, enabled: bool
         p.rect_stroke(rect, 5.0f32, egui::Stroke::new(1.0f32, line), egui::StrokeKind::Inside);
     }
     let push = if pressed { 1.5 } else { 0.0 };
-    let icon_rect = Rect::from_center_size(rect.center_top() + vec2(0.0, 6.0 + ICON / 2.0 + push), vec2(ICON, ICON));
+    let icon_rect = Rect::from_center_size(rect.center_top() + vec2(0.0, 4.0 + ICON / 2.0 + push), vec2(ICON, ICON));
     let tint = if enabled { Color32::WHITE } else { Color32::from_white_alpha(70) };
     p.image(icon.id(), icon_rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
     let color = if enabled { Color32::from_gray(25) } else { Color32::from_gray(160) };
-    p.text(rect.center_bottom() - vec2(0.0, 9.0 - push), Align2::CENTER_CENTER, label, font, color);
+    p.text(rect.center_bottom() - vec2(0.0, 8.0 - push), Align2::CENTER_CENTER, label, font, color);
     resp
 }
 
