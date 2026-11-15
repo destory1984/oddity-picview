@@ -25,6 +25,47 @@ const AUTHOR: &str = "destory1984";
 const REPO_URL: &str = "https://github.com/destory1984/oddity-picview";
 
 const GAP: f32 = 8.0;
+/// Above this thumbnail size folders get their own block of small tiles.
+const FOLDER_THUMB: f32 = 96.0;
+/// Extra space (with a thin line) between the folder block and the files.
+const SECTION_GAP: f32 = 14.0;
+
+/// One row of the thumbnail grid. Slots count the ".." cell first.
+#[derive(Clone, Copy)]
+struct GridRow {
+    top: f32,
+    first: usize,
+    count: usize,
+    cell: Vec2,
+}
+
+struct GridLayout {
+    rows: Vec<GridRow>,
+    total_h: f32,
+    /// y of the line between folders and files
+    split_y: Option<f32>,
+}
+
+impl GridLayout {
+    fn row_of(&self, slot: usize) -> Option<usize> {
+        self.rows.iter().position(|r| slot >= r.first && slot < r.first + r.count)
+    }
+
+    /// Slot `k` rows up (-) or down (+) from `slot`, keeping the same x where possible.
+    fn step_rows(&self, slot: usize, k: isize) -> Option<usize> {
+        let r = self.row_of(slot)?;
+        let row = self.rows[r];
+        let x = (slot - row.first) as f32 * (row.cell.x + GAP) + row.cell.x / 2.0;
+        let nr = (r as isize + k).clamp(0, self.rows.len() as isize - 1) as usize;
+        let to = self.rows[nr];
+        let c = ((x / (to.cell.x + GAP)).floor().max(0.0) as usize).min(to.count - 1);
+        Some(to.first + c)
+    }
+}
+
+fn cell_of(ts: f32) -> Vec2 {
+    vec2(ts + 16.0, ts + 16.0 + 22.0)
+}
 const MAX_THUMBS_LOADED: usize = 800;
 const BIG_CACHE: usize = 8;
 const SCROLL_ANIM: Duration = Duration::from_millis(120);
@@ -225,7 +266,8 @@ struct App {
     fwd: Vec<PathBuf>,
 
     thumb_size: f32,
-    cols: usize,
+    /// grid width from the last frame, for layout outside of drawing
+    grid_w: f32,
     grid_offset: f32,
     grid_view_h: f32,
     grid_scroll_to: Option<f32>,
@@ -312,7 +354,7 @@ impl App {
             back: Vec::new(),
             fwd: Vec::new(),
             thumb_size: saved.thumb_size.clamp(64.0, 256.0),
-            cols: 1,
+            grid_w: 800.0,
             grid_offset: 0.0,
             grid_view_h: 600.0,
             grid_scroll_to: None,
@@ -710,10 +752,39 @@ impl App {
         self.cur_dir.parent().is_some() as usize
     }
 
+    /// Rows of the grid for width `w`. Folders come first (sorting keeps them
+    /// there); with big thumbnails they get small tiles in a block of their own.
+    fn layout(&self, w: f32) -> GridLayout {
+        let off = self.slot_off();
+        let total = self.entries.len() + off;
+        let ndirs = self.entries.iter().take_while(|e| e.is_dir).count();
+        let nfs = if self.thumb_size > FOLDER_THUMB { off + ndirs } else { 0 };
+        let mut rows = Vec::new();
+        let mut y = 0.0;
+        let section = |rows: &mut Vec<GridRow>, y: &mut f32, start: usize, end: usize, cell: Vec2| {
+            let cols = (((w + GAP) / (cell.x + GAP)).floor() as usize).max(1);
+            let mut s = start;
+            while s < end {
+                let count = cols.min(end - s);
+                rows.push(GridRow { top: *y, first: s, count, cell });
+                *y += cell.y + GAP;
+                s += count;
+            }
+        };
+        section(&mut rows, &mut y, 0, nfs, cell_of(FOLDER_THUMB));
+        let mut split_y = None;
+        if nfs > 0 && nfs < total {
+            split_y = Some(y - GAP / 2.0 + SECTION_GAP / 2.0);
+            y += SECTION_GAP;
+        }
+        section(&mut rows, &mut y, nfs, total, self.cell_size());
+        GridLayout { rows, total_h: (y - GAP).max(0.0), split_y }
+    }
+
     fn ensure_visible(&mut self, i: usize) {
-        let cell = self.cell_size();
-        let pitch = cell.y + GAP;
-        let top = ((i + self.slot_off()) / self.cols.max(1)) as f32 * pitch;
+        let lay = self.layout(self.grid_w);
+        let Some(r) = lay.row_of(i + self.slot_off()).map(|r| lay.rows[r]) else { return };
+        let (top, cell) = (r.top, r.cell);
         if top < self.grid_offset {
             self.grid_scroll_to = Some(top);
         } else if top + cell.y > self.grid_offset + self.grid_view_h {
@@ -1533,22 +1604,34 @@ impl App {
         if n == 0 {
             return;
         }
-        let cols = self.cols.max(1) as isize;
-        let page = ((self.grid_view_h / (self.cell_size().y + GAP)).floor().max(1.0) as isize) * cols;
-        let mut delta: Option<isize> = None;
+        let page = (self.grid_view_h / (self.cell_size().y + GAP)).floor().max(1.0) as isize;
+        let mut delta: Option<isize> = None; // along the list
+        let mut vrows: Option<isize> = None; // rows up / down
         let mut target: Option<usize> = None;
         if pressed(Key::ArrowRight) { delta = Some(1) }
         if pressed(Key::ArrowLeft) { delta = Some(-1) }
-        if pressed(Key::ArrowDown) { delta = Some(cols) }
-        if pressed(Key::ArrowUp) { delta = Some(-cols) }
-        if pressed(Key::PageDown) { delta = Some(page) }
-        if pressed(Key::PageUp) { delta = Some(-page) }
+        if pressed(Key::ArrowDown) { vrows = Some(1) }
+        if pressed(Key::ArrowUp) { vrows = Some(-1) }
+        if pressed(Key::PageDown) { vrows = Some(page) }
+        if pressed(Key::PageUp) { vrows = Some(-page) }
         if pressed(Key::Home) { target = Some(0) }
         if pressed(Key::End) { target = Some(n - 1) }
         if let Some(d) = delta {
             target = Some(match self.focus {
                 None => 0,
                 Some(f) => (f as isize + d).clamp(0, n as isize - 1) as usize,
+            });
+        }
+        if let Some(k) = vrows {
+            // rows can differ in width (small folder tiles), so step by geometry
+            target = Some(match self.focus {
+                None => 0,
+                Some(f) => {
+                    let off = self.slot_off();
+                    let lay = self.layout(self.grid_w);
+                    let slot = lay.step_rows(f + off, k).unwrap_or(f + off);
+                    slot.max(off) - off // never land on ".."
+                }
             });
         }
         if let Some(t) = target {
@@ -1896,17 +1979,13 @@ impl App {
             ui.centered_and_justified(|ui| ui.weak(msg));
             return;
         }
-        let slots = n + off;
-        let cell = self.cell_size();
         let avail = ui.available_width();
-        let cols = (((avail + GAP) / (cell.x + GAP)).floor() as usize).max(1);
-        self.cols = cols;
-        let rows = slots.div_ceil(cols);
-        ui.spacing_mut().item_spacing.y = GAP;
+        self.grid_w = avail;
+        let lay = self.layout(avail);
         if self.grid_scroll_to.is_some() {
             self.scroll_anim = None; // keyboard / navigation jumps win over the animation
         }
-        self.wheel_rows(ui, rows);
+        self.wheel_rows(ui, &lay);
         if let Some((from, to, start)) = self.scroll_anim {
             let t = (start.elapsed().as_secs_f32() / SCROLL_ANIM.as_secs_f32()).min(1.0);
             let ease = 1.0 - (1.0 - t).powi(3); // ease-out cubic
@@ -1922,20 +2001,24 @@ impl App {
         if let Some(off) = self.grid_scroll_to.take() {
             sa = sa.vertical_scroll_offset(off);
         }
-        let out = sa.show_rows(ui, cell.y, rows, |ui, range| {
-            // grid slots -> entry indices (slot 0 may be "..")
-            let s = (range.start * cols).saturating_sub(off);
-            let e = (range.end * cols).saturating_sub(off).min(n);
-            self.vis_start.store(s, Ordering::Relaxed);
-            self.vis_end.store(e, Ordering::Relaxed);
-            for r in range.clone() {
-                let (row_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), cell.y), Sense::hover());
-                for c in 0..cols {
-                    let slot = r * cols + c;
-                    if slot >= slots {
-                        break;
-                    }
-                    let rect = Rect::from_min_size(row_rect.min + vec2(c as f32 * (cell.x + GAP), 0.0), cell);
+        let out = sa.show_viewport(ui, |ui, vp| {
+            ui.set_height(lay.total_h);
+            let origin = ui.max_rect().min;
+            if let Some(y) = lay.split_y {
+                let y = origin.y + y;
+                ui.painter().hline(origin.x..=origin.x + avail, y, Stroke::new(1.0f32, Color32::from_gray(215)));
+            }
+            let visible: Vec<usize> = (0..lay.rows.len())
+                .filter(|&r| {
+                    let row = lay.rows[r];
+                    row.top + row.cell.y >= vp.min.y && row.top <= vp.max.y
+                })
+                .collect();
+            for &r in &visible {
+                let row = lay.rows[r];
+                for c in 0..row.count {
+                    let slot = row.first + c;
+                    let rect = Rect::from_min_size(origin + vec2(c as f32 * (row.cell.x + GAP), row.top), row.cell);
                     if slot < off {
                         self.up_cell(ui, rect);
                     } else {
@@ -1943,9 +2026,17 @@ impl App {
                     }
                 }
             }
-            // visible first, then two rows ahead
-            for i in s..((range.end + 2) * cols).saturating_sub(off).min(n) {
-                self.request_thumb(i);
+            // grid slots -> entry indices (slot 0 may be ".."); visible first, then two rows ahead
+            if let (Some(&r0), Some(&r1)) = (visible.first(), visible.last()) {
+                let s = lay.rows[r0].first.saturating_sub(off);
+                let last = lay.rows[r1];
+                let e = (last.first + last.count).saturating_sub(off).min(n);
+                self.vis_start.store(s, Ordering::Relaxed);
+                self.vis_end.store(e, Ordering::Relaxed);
+                let ahead = lay.rows.get(r1 + 2).or(lay.rows.last()).map(|r| r.first + r.count).unwrap_or(0);
+                for i in s..ahead.saturating_sub(off).min(n) {
+                    self.request_thumb(i);
+                }
             }
         });
         self.grid_offset = out.state.offset.y;
@@ -1953,7 +2044,7 @@ impl App {
     }
 
     /// One wheel notch scrolls exactly one row of thumbnails.
-    fn wheel_rows(&mut self, ui: &mut Ui, rows: usize) {
+    fn wheel_rows(&mut self, ui: &mut Ui, lay: &GridLayout) {
         if !ui.rect_contains_pointer(ui.max_rect()) {
             return;
         }
@@ -2015,9 +2106,20 @@ impl App {
             Some((_, to, _)) => to,
             None => self.grid_scroll_to.unwrap_or(self.grid_offset),
         };
-        let row = (base / pitch).round() - steps; // wheel up (+) = earlier rows
-        let max = (rows as f32 * pitch - GAP - self.grid_view_h).max(0.0);
-        let to = (row * pitch).clamp(0.0, max);
+        if lay.rows.is_empty() {
+            return;
+        }
+        // row whose top is nearest the current position, then step from it
+        let cur = lay
+            .rows
+            .iter()
+            .enumerate()
+            .min_by(|a, b| (a.1.top - base).abs().total_cmp(&(b.1.top - base).abs()))
+            .map(|(i, _)| i as isize)
+            .unwrap_or(0);
+        let row = (cur - steps as isize).clamp(0, lay.rows.len() as isize - 1) as usize; // wheel up (+) = earlier rows
+        let max = (lay.total_h - self.grid_view_h).max(0.0);
+        let to = lay.rows[row].top.clamp(0.0, max);
         self.grid_scroll_to = None;
         self.scroll_anim = Some((self.grid_offset, to, Instant::now()));
     }
@@ -2030,7 +2132,7 @@ impl App {
         let bg = if resp.hovered() { Color32::from_rgb(235, 244, 255) } else { Color32::WHITE };
         painter.rect_filled(rect, 4.0f32, bg);
         painter.rect_stroke(rect, 4.0f32, Stroke::new(1.0f32, Color32::from_gray(215)), egui::StrokeKind::Inside);
-        let ts = self.thumb_size;
+        let ts = rect.width() - 16.0;
         let img_area = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(ts, ts));
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         let fr = Rect::from_center_size(img_area.center(), img_area.size() * 0.60);
@@ -2072,7 +2174,7 @@ impl App {
         painter.rect_filled(rect, 4.0f32, bg);
         painter.rect_stroke(rect, 4.0f32, Stroke::new(1.0f32, border), egui::StrokeKind::Inside);
 
-        let ts = self.thumb_size;
+        let ts = rect.width() - 16.0;
         let img_area = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(ts, ts));
         let e = &self.entries[i];
         if e.is_dir {
@@ -2484,7 +2586,15 @@ impl App {
                 offset: [0, 4], blur: 12, spread: 0, color: C::from_black_alpha(32),
             });
         let mut open = true;
-        egui::Window::new(RichText::new("설정").size(18.0).color(text))
+        // title "설정" with the version in small grey type right after it
+        let mut title = LayoutJob::default();
+        title.append("설정", 0.0, TextFormat {
+            font_id: egui::FontId::proportional(18.0), color: text, valign: Align::BOTTOM, ..Default::default()
+        });
+        title.append(concat!("v", env!("CARGO_PKG_VERSION")), 6.0, TextFormat {
+            font_id: egui::FontId::proportional(12.0), color: muted, valign: Align::BOTTOM, ..Default::default()
+        });
+        egui::Window::new(title)
             .open(&mut open).collapsible(false).resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .default_width(420.0).frame(frame).show(ctx, |ui| {
