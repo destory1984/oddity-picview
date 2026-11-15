@@ -127,6 +127,8 @@ struct Settings {
     transfer_dirs: Vec<PathBuf>,
     /// thumbnail cache limit; trimmed to 80% of it at start-up
     cache_max_mb: u64,
+    /// ask before sending files to the recycle bin
+    confirm_delete: bool,
 }
 
 impl Default for Settings {
@@ -140,6 +142,7 @@ impl Default for Settings {
             favorites: Vec::new(),
             transfer_dirs: Vec::new(),
             cache_max_mb: cache::DEFAULT_MAX_MB,
+            confirm_delete: true,
         }
     }
 }
@@ -228,7 +231,9 @@ struct App {
     /// folder under the pointer while dragging files (set by drop targets each frame)
     dnd_target: Option<PathBuf>,
     cache_max_mb: u64,
+    confirm_delete: bool,
     show_settings: bool,
+    show_about: bool,
     /// bytes in the thumbnail cache, measured in the background (u64::MAX = not yet)
     cache_usage: Arc<AtomicU64>,
 }
@@ -298,7 +303,9 @@ impl App {
             transfer_dirs: saved.transfer_dirs.iter().filter(|p| p.is_dir()).take(TRANSFER_MAX).cloned().collect(),
             dnd_target: None,
             cache_max_mb: saved.cache_max_mb.clamp(CACHE_MIN_MB, CACHE_MAX_MB),
+            confirm_delete: saved.confirm_delete,
             show_settings: false,
+            show_about: false,
             cache_usage: Arc::new(AtomicU64::new(u64::MAX)),
             recent: saved.recent.into_iter().filter(|p| p.is_dir()).take(RECENT_MAX).collect(),
         };
@@ -844,8 +851,13 @@ impl App {
     fn ask_delete(&mut self, paths: Vec<PathBuf>) {
         // drive roots cannot go to the recycle bin
         let paths: Vec<PathBuf> = paths.into_iter().filter(|p| p.exists() && p.parent().is_some()).collect();
-        if !paths.is_empty() {
+        if paths.is_empty() {
+            return;
+        }
+        if self.confirm_delete {
             self.dialog = Some(Dialog::Delete(paths));
+        } else {
+            self.do_delete(paths); // still the recycle bin, so it can be undone
         }
     }
 
@@ -1297,7 +1309,7 @@ impl App {
     // ------------------------------------------------------------ UI: browser
 
     fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.show_settings
+        self.dialog.is_some() || self.show_settings || self.show_about
     }
 
     fn grid_keys(&mut self, ctx: &egui::Context) {
@@ -2288,34 +2300,78 @@ impl App {
                                 .size(12.0).color(muted)).wrap());
                         }
                     });
-                // about: name, version, author, GitHub
+                // deleting files: ask first or not
                 Frame::new().fill(C::from_rgb(248, 250, 252))
                     .stroke(Stroke::new(1.0f32, line)).corner_radius(CornerRadius::same(6))
                     .inner_margin(14).show(ui, |ui| {
                         ui.set_width(390.0);
                         ui.horizontal(|ui| {
-                            ui.image((self.icons.view.id(), vec2(16.0, 16.0)));
-                            ui.label(RichText::new("프로그램 정보").size(15.0).strong());
+                            ui.image((self.icons.delete.id(), vec2(16.0, 16.0)));
+                            ui.label(RichText::new("파일 지우기").size(15.0).strong());
                         });
                         ui.separator();
-                        egui::Grid::new("about_grid").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
-                            ui.label(RichText::new("이름").color(muted));
-                            ui.label(RichText::new("Oddity PicView").strong());
-                            ui.end_row();
-                            ui.label(RichText::new("버전").color(muted));
-                            ui.label(env!("CARGO_PKG_VERSION"));
-                            ui.end_row();
-                            ui.label(RichText::new("만든 사람").color(muted));
-                            ui.label(AUTHOR);
-                            ui.end_row();
-                            ui.label(RichText::new("GitHub").color(muted));
-                            ui.hyperlink_to(REPO_URL.trim_start_matches("https://"), REPO_URL)
-                                .on_hover_text("브라우저로 엽니다");
-                            ui.end_row();
-                        });
+                        ui.radio_value(&mut self.confirm_delete, true, "지우기 전에 물어보기");
+                        ui.radio_value(&mut self.confirm_delete, false, "묻지 않고 바로 휴지통으로 보내기");
+                        ui.add(egui::Label::new(RichText::new(
+                            "어느 쪽이든 휴지통으로 가므로 되살릴 수 있습니다."
+                        ).size(12.0).color(muted)).wrap());
                     });
+                // program info lives in its own small window
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    let image = egui::Image::new((self.icons.view.id(), vec2(16.0, 16.0)));
+                    if ui.add(egui::Button::image_and_text(image, "About")).on_hover_text("프로그램 정보").clicked() {
+                        self.show_about = true;
+                    }
+                });
             });
-        self.show_settings = open;
+        // Esc goes back to the main screen (the About window on top closes first)
+        let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+        self.show_settings = open && !(esc && !self.show_about);
+    }
+
+    /// "About": name, version, author, GitHub. Same frame as the settings window.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        use egui::{Color32 as C, CornerRadius, Frame, RichText, Stroke, vec2};
+        if !self.show_about {
+            return;
+        }
+        let text = C::from_rgb(36, 48, 60);
+        let muted = C::from_rgb(111, 124, 140);
+        let frame = Frame::new().fill(C::WHITE)
+            .stroke(Stroke::new(1.0f32, C::from_rgb(213, 218, 225)))
+            .corner_radius(CornerRadius::same(8)).inner_margin(16)
+            .shadow(egui::epaint::Shadow { offset: [0, 4], blur: 12, spread: 0, color: C::from_black_alpha(32) });
+        let mut open = true;
+        egui::Window::new(RichText::new("About").size(18.0).color(text))
+            .id(Id::new("about_window"))
+            .open(&mut open).collapsible(false).resizable(false)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.vertical_centered(|ui| {
+                    ui.image((self.icons.view.id(), vec2(48.0, 48.0)));
+                    ui.label(RichText::new("Oddity PicView").size(20.0).strong().color(text));
+                    ui.label(RichText::new(format!("버전 {}", env!("CARGO_PKG_VERSION"))).color(muted));
+                });
+                ui.add_space(8.0);
+                ui.separator();
+                egui::Grid::new("about_grid").num_columns(2).spacing(vec2(16.0, 8.0)).show(ui, |ui| {
+                    ui.label(RichText::new("만든 사람").color(muted));
+                    ui.label(AUTHOR);
+                    ui.end_row();
+                    ui.label(RichText::new("GitHub").color(muted));
+                    ui.hyperlink_to(REPO_URL.trim_start_matches("https://"), REPO_URL)
+                        .on_hover_text("브라우저로 엽니다");
+                    ui.end_row();
+                    ui.label(RichText::new("라이선스").color(muted));
+                    ui.label("MIT");
+                    ui.end_row();
+                });
+            });
+        if !open || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.show_about = false;
+        }
     }
 
     // ------------------------------------------------------------ dialogs
@@ -2518,6 +2574,7 @@ impl eframe::App for App {
             favorites: self.favorites.clone(),
             transfer_dirs: self.transfer_dirs.clone(),
             cache_max_mb: self.cache_max_mb,
+            confirm_delete: self.confirm_delete,
         };
         eframe::set_value(storage, eframe::APP_KEY, &s);
     }
@@ -2539,9 +2596,11 @@ impl eframe::App for App {
         static SETTINGS_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if std::env::var_os("PICVIEW_SHOW_SETTINGS").is_some() && !SETTINGS_SHOWN.swap(true, Ordering::Relaxed) {
             self.open_settings();
+            self.show_about = std::env::var_os("PICVIEW_SHOW_ABOUT").is_some();
         }
         self.dialogs(ctx);
         self.settings_window(ctx);
+        self.about_window(ctx);
         self.drag_overlay(ctx);
         self.run_actions();
         self.evict_thumbs();
