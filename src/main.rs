@@ -1416,12 +1416,18 @@ impl App {
             }
             let r = tool_button(ui, &ic.recent, "최근", true).on_hover_text("최근에 연 폴더 10개");
             let pid = ui.make_persistent_id("recent_popup");
+            // PICVIEW_SHOW_MENU=recent opens this popup once at start (screenshots)
+            static RECENT_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if std::env::var("PICVIEW_SHOW_MENU").is_ok_and(|v| v == "recent") && !RECENT_SHOWN.swap(true, Ordering::Relaxed) {
+                ui.memory_mut(|m| m.open_popup(pid));
+            }
             if r.clicked() {
                 ui.memory_mut(|m| m.toggle_popup(pid));
             }
             let mut go: Option<PathBuf> = None;
             egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-                icons::style_menu(ui, 320.0);
+                // wide enough for long paths
+                icons::style_menu(ui, 640.0);
                 for (k, p) in self.recent.iter().enumerate() {
                     let text = egui::RichText::new(format!("{}   {}", k + 1, p.display()));
                     let text = if *p == self.cur_dir { text.strong() } else { text };
@@ -1473,7 +1479,7 @@ impl App {
             let pid = ui.make_persistent_id("more_popup");
             // PICVIEW_SHOW_MENU=1 opens this popup once at start (for screenshots of the menu style)
             static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if std::env::var_os("PICVIEW_SHOW_MENU").is_some() && !SHOWN.swap(true, Ordering::Relaxed) {
+            if std::env::var("PICVIEW_SHOW_MENU").is_ok_and(|v| v != "recent") && !SHOWN.swap(true, Ordering::Relaxed) {
                 ui.memory_mut(|m| m.open_popup(pid));
             }
             if r.clicked() {
