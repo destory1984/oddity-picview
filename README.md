@@ -107,6 +107,7 @@ PICVIEW_BENCH_DIR=C:\Users\me\Pictures cargo test --release bench -- --ignored -
 
 - 처음 실행할 때 "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행**을 누른다. 코드 서명을 하지 않은 프로그램이라 인터넷에서 받은 exe에 윈도우가 띄우는 경고다. 직접 빌드한 exe에는 뜨지 않는다.
 - HEIC, RAW를 보려면 Microsoft Store에서 "HEIF 이미지 확장", "Raw 이미지 확장"을 설치한다.
+- Windows 보안의 "제어된 폴더 액세스"(랜섬웨어 방지)가 켜져 있으면, 사진·문서·바탕 화면 폴더에서 회전 저장, 이름 바꾸기, 옮기기, 삭제가 "허용되지 않은 변경이 차단됨" 알림과 함께 막힌다. 해결 방법 4가지와 장단점은 [docs/controlled-folder-access.md](docs/controlled-folder-access.md) 에 있다.
 
 경고 창 없이 받으려면, 명령 프롬프트나 PowerShell에서 curl로 받는다. curl은 윈도우 10, 11에 기본으로 들어 있다.
 
