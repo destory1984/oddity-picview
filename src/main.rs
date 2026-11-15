@@ -7,6 +7,7 @@ mod icons;
 mod loader;
 mod rotate;
 mod pane;
+mod watch;
 
 use pane::*;
 
@@ -81,15 +82,16 @@ enum Big {
 }
 
 enum Msg {
+    DirChanged { dir: PathBuf },
     Thumb { pane: usize, gen: u64, idx: usize, mtime: SystemTime, tex: TextureHandle },
     ThumbFail { pane: usize, gen: u64, idx: usize },
     Skip { pane: usize, gen: u64, idx: usize },
-    Big { path: PathBuf, mtime: Option<SystemTime>, res: Result<(TextureHandle, [u32; 2]), String> },
+    Big { path: PathBuf, stamp: Option<(u64, SystemTime)>, res: Result<(TextureHandle, [u32; 2]), String> },
     Rotated { path: PathBuf, turns: i32, res: Result<(), String> },
     /// frames of an animated GIF, sent after its first frame (`Big`)
-    Anim { path: PathBuf, frames: Vec<(TextureHandle, Duration)> },
+    Anim { path: PathBuf, stamp: Option<(u64, SystemTime)>, frames: Vec<(TextureHandle, Duration)> },
     /// video preview frames (None: Windows could not decode it)
-    Clip { path: PathBuf, frames: Option<Vec<TextureHandle>> },
+    Clip { path: PathBuf, stamp: Option<(u64, SystemTime)>, frames: Option<Vec<TextureHandle>> },
     OpDone { status: String, dirs: Vec<PathBuf>, clear_clipboard: bool },
 }
 
@@ -215,6 +217,8 @@ struct App {
 
     tx: mpsc::Sender<Msg>,
     rx: mpsc::Receiver<Msg>,
+    watch: Option<watch::DirWatch>,
+    dir_changes: HashMap<PathBuf, (Instant, Instant)>,
 
     thumb_size: f32,
 
@@ -302,6 +306,7 @@ impl App {
             self.panes.push(pane);
             self.navigate(pi, dir.clone(), false);
         }
+        self.sync_watch_dirs();
         self.open_tree_to(&self.pane().cur_dir.clone());
     }
 
@@ -324,6 +329,8 @@ impl App {
             split: Split::One,
             active: 0,
             ctx: cc.egui_ctx.clone(),
+            watch: watch::DirWatch::new(tx.clone(), cc.egui_ctx.clone()),
+            dir_changes: HashMap::new(),
             tx,
             rx,
             thumb_size: saved.thumb_size.clamp(64.0, 256.0),
@@ -430,6 +437,7 @@ impl App {
         self.panes[pi].focus_dims = None;
         self.panes[pi].grid_scroll_to = Some(0.0);
         if pi == self.active { self.open_tree_to(&dir); }
+        self.sync_watch_dirs();
     }
 
     /// List a folder, count each kind, and keep only the kind picked in the filter.
@@ -461,47 +469,103 @@ impl App {
         }
     }
 
-    /// Re-read the current folder, keeping already made thumbnails.
-    fn reload(&mut self, pi: usize, focus_path: Option<PathBuf>) {
-        let Ok(entries) = self.list_filtered(pi, &self.panes[pi].cur_dir.clone()) else { return };
-        let mut old: HashMap<PathBuf, TextureHandle> = HashMap::new();
-        let pane = &mut self.panes[pi];
-        for (e, t) in pane.entries.iter().zip(pane.thumbs.drain(..)) {
-            if let Thumb::Ready(tex) = t {
-                old.insert(e.path.clone(), tex);
+    fn sync_watch_dirs(&mut self) {
+        let dirs: Vec<_> = self.panes.iter().map(|p| p.cur_dir.clone()).collect();
+        self.dir_changes.retain(|d, _| dirs.contains(d));
+        if let Some(watch) = &mut self.watch { watch.set_dirs(&dirs); }
+    }
+
+    fn refresh_changed_dirs(&mut self) {
+        if self.dir_changes.is_empty() { return; }
+        if self.dialog.is_some() || egui::DragAndDrop::has_any_payload(&self.ctx) {
+            self.ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
+        let now = Instant::now();
+        let ready: Vec<_> = self.dir_changes.iter()
+            .filter(|(_, (first, last))| watch::due(*first, *last, now))
+            .map(|(dir, _)| dir.clone()).collect();
+        for dir in ready {
+            self.dir_changes.remove(&dir);
+            self.refresh_dir(&dir);
+        }
+        if let Some(wait) = self.dir_changes.values().map(|&(first, last)| watch::wait_for(first, last, now)).min() {
+            self.ctx.request_repaint_after(wait);
+        }
+    }
+
+    fn restore_missing_dirs(&mut self) {
+        for pi in 0..self.panes.len() {
+            let cur = self.panes[pi].cur_dir.clone();
+            if !cur.as_os_str().is_empty() && !cur.is_dir() {
+                if self.viewer.as_ref().is_some_and(|v| v.pane == pi) { self.viewer = None; }
+                let fallback = cur.ancestors().last().map(Path::to_path_buf).unwrap_or_default();
+                self.navigate(pi, restore_dir(&cur, &fallback), false);
             }
         }
-        // remember the focused file by path: the index means nothing in the new list
-        let old_focus = self.panes[pi].focus;
-        let old_focus_path = old_focus.and_then(|i| self.panes[pi].entries.get(i)).map(|e| e.path.clone());
-        self.panes[pi].focus = None;
-        self.panes[pi].entries = entries;
-        self.panes[pi].thumbs = self.panes[pi].entries
-            .iter()
-            .map(|e| old.remove(&e.path).map(Thumb::Ready).unwrap_or(Thumb::None))
-            .collect();
-        self.panes[pi].thumbs_loaded = self.panes[pi].thumbs.iter().filter(|t| matches!(t, Thumb::Ready(_))).count();
-        self.panes[pi].gen.fetch_add(1, Ordering::SeqCst);
-        self.sort_entries(pi);
-        self.panes[pi].selected.clear();
-        let n = self.panes[pi].entries.len();
-        let explicit = focus_path.is_some();
-        let target = focus_path
-            .and_then(|p| self.panes[pi].index_of(&p))
-            .or_else(|| old_focus_path.and_then(|p| self.panes[pi].index_of(&p)))
-            .or_else(|| old_focus.filter(|_| n > 0).map(|f| f.min(n - 1)));
-        match target {
-            // a file we were asked to show (rename, new folder): scroll to it
-            Some(i) if explicit => self.select_single(pi, i),
-            // after a move / paste / refresh: keep the view where it is
-            Some(i) => {
-                self.panes[pi].selected.insert(i);
-                self.panes[pi].anchor = Some(i);
-                self.set_focus(pi, i);
+    }
+
+    /// Re-read the current folder, keeping unchanged textures and paths.
+    fn reload(&mut self, pi: usize, focus_path: Option<PathBuf>) {
+        let Ok(entries) = self.list_filtered(pi, &self.panes[pi].cur_dir.clone()) else { return };
+        let pane = &mut self.panes[pi];
+        let selected: Vec<_> = pane.selected.iter().filter_map(|&i| pane.entries.get(i)).map(|e| e.path.clone()).collect();
+        let anchor = pane.anchor.and_then(|i| pane.entries.get(i)).map(|e| e.path.clone());
+        let old_focus = pane.focus;
+        let old_focus_path = old_focus.and_then(|i| pane.entries.get(i)).map(|e| e.path.clone());
+        let viewed = self.viewer.as_ref().filter(|v| v.pane == pi)
+            .and_then(|v| pane.entries.get(v.idx)).map(|e| e.path.clone());
+        let mut old = HashMap::new();
+        for (e, t) in pane.entries.iter().zip(pane.thumbs.drain(..)) {
+            old.insert(e.path.clone(), (e.size, e.modified, t));
+        }
+        pane.thumbs = entries.iter().map(|e| {
+            match old.remove(&e.path) {
+                Some((size, modified, t)) if thumb_still_valid(size, modified, e.size, e.modified) => {
+                    if matches!(t, Thumb::Ready(_)) { t } else { Thumb::None }
+                }
+                Some(_) => {
+                    self.big.remove(&e.path);
+                    self.big_order.retain(|p| p != &e.path);
+                    self.anims.remove(&e.path);
+                    self.clips.remove(&e.path);
+                    self.clip_order.retain(|p| p != &e.path);
+                    Thumb::None
+                }
+                None => Thumb::None,
             }
-            None => {
-                self.panes[pi].focus = None;
-                self.panes[pi].anchor = None;
+        }).collect();
+        for path in old.keys() {
+            self.big.remove(path);
+            self.big_order.retain(|p| p != path);
+            self.anims.remove(path);
+            self.clips.remove(path);
+            self.clip_order.retain(|p| p != path);
+        }
+        pane.entries = entries;
+        pane.focus = None;
+        pane.focus_dims = None;
+        pane.clip_hover = None;
+        pane.pending_open = None;
+        pane.thumbs_loaded = pane.thumbs.iter().filter(|t| matches!(t, Thumb::Ready(_))).count();
+        pane.gen.fetch_add(1, Ordering::SeqCst);
+        self.sort_entries(pi);
+        let pane = &mut self.panes[pi];
+        pane.selected = selected.iter().filter_map(|p| pane.index_of(p)).collect();
+        pane.anchor = anchor.and_then(|p| pane.index_of(&p));
+        let n = pane.entries.len();
+        let explicit = focus_path.is_some();
+        let target = focus_path.and_then(|p| pane.index_of(&p))
+            .or_else(|| old_focus_path.and_then(|p| pane.index_of(&p)))
+            .or_else(|| old_focus.filter(|_| n > 0).map(|f| f.min(n - 1)));
+        if let Some(i) = target {
+            if explicit { self.select_single(pi, i); }
+            else { self.set_focus(pi, i); }
+        }
+        if self.viewer.as_ref().is_some_and(|v| v.pane == pi) {
+            match viewed.and_then(|p| self.panes[pi].index_of(&p)) {
+                Some(i) => self.viewer.as_mut().unwrap().idx = i,
+                None => self.viewer = None,
             }
         }
         self.tree_children.remove(&self.panes[pi].cur_dir);
@@ -809,7 +873,7 @@ impl App {
                     })
                     .collect()
             });
-            let _ = tx.send(Msg::Clip { path, frames });
+            let _ = tx.send(Msg::Clip { path, stamp: Some((size, modified)), frames });
             ctx.request_repaint();
         });
     }
@@ -941,6 +1005,10 @@ impl App {
         });
     }
 
+    fn file_stamp(&self, path: &Path) -> Option<(u64, SystemTime)> {
+        self.panes.iter().find_map(|p| p.index_of(path).map(|i| (p.entries[i].size, p.entries[i].modified)))
+    }
+
     fn request_big(&mut self, path: &Path) {
         if self.big.contains_key(path) {
             if let Some(pos) = self.big_order.iter().position(|p| p == path) {
@@ -957,7 +1025,7 @@ impl App {
                 self.anims.remove(&old);
             }
         }
-        let mtime = self.pane().index_of(path).map(|i| self.panes[self.active].entries[i].modified);
+        let stamp = self.file_stamp(path);
         let path = path.to_path_buf();
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let max_side = ctx.input(|i| i.max_texture_side).min(16384) as u32;
@@ -972,7 +1040,7 @@ impl App {
                 (ctx.load_texture(path.display().to_string(), ci, tex_opts()), dims)
             });
             let ok = res.is_ok();
-            let _ = tx.send(Msg::Big { path: path.clone(), mtime, res });
+            let _ = tx.send(Msg::Big { path: path.clone(), stamp, res });
             ctx.request_repaint();
             // animated GIF: the first frame is up already, the rest follow
             let is_gif = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif"));
@@ -986,7 +1054,7 @@ impl App {
                             (ctx.load_texture(format!("{}#{k}", path.display()), ci, tex_opts()), delay)
                         })
                         .collect();
-                    let _ = tx.send(Msg::Anim { path, frames });
+                    let _ = tx.send(Msg::Anim { path, stamp, frames });
                     ctx.request_repaint();
                 }
             }
@@ -996,6 +1064,12 @@ impl App {
     fn poll_msgs(&mut self) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
+                Msg::DirChanged { dir } => {
+                    if self.panes.iter().any(|p| p.cur_dir == dir) {
+                        let now = Instant::now();
+                        self.dir_changes.entry(dir).and_modify(|times| times.1 = now).or_insert((now, now));
+                    }
+                }
                 Msg::Thumb { pane, gen: g, idx, mtime, tex } if route_ok(&self.panes, pane, g, idx) => {
                     if self.panes[pane].entries[idx].modified == mtime {
                         self.panes[pane].thumbs[idx] = Thumb::Ready(tex);
@@ -1011,7 +1085,8 @@ impl App {
                     }
                 }
                 Msg::Rotated { path, turns, res } => self.on_rotated(path, turns, res),
-                Msg::Clip { path, frames } => {
+                Msg::Clip { path, stamp, frames } => {
+                    if stamp != self.file_stamp(&path) { continue; }
                     if self.clips.contains_key(&path) {
                         let clip = match frames {
                             Some(f) if !f.is_empty() => {
@@ -1024,7 +1099,8 @@ impl App {
                         self.clips.insert(path, clip);
                     }
                 }
-                Msg::Anim { path, frames } => {
+                Msg::Anim { path, stamp, frames } => {
+                    if stamp != self.file_stamp(&path) { continue; }
                     if self.big.contains_key(&path) {
                         let total = frames.iter().map(|f| f.1).sum();
                         self.anims.insert(path, Anim { frames, total, start: Instant::now() });
@@ -1039,21 +1115,11 @@ impl App {
                     for d in dirs {
                         self.refresh_dir(&d);
                     }
-                    // a pane may have shown a folder that was just moved away
-                    for pi in 0..self.panes.len() {
-                        let cur = self.panes[pi].cur_dir.clone();
-                        if !cur.as_os_str().is_empty() && !cur.is_dir() {
-                            let fallback = cur.ancestors().last().map(Path::to_path_buf).unwrap_or_default();
-                            self.navigate(pi, restore_dir(&cur, &fallback), false);
-                        }
-                    }
+                    self.restore_missing_dirs();
                 }
-                Msg::Big { path, mtime, res } => {
-                    let now = self.panes.iter().find_map(|p| p.index_of(&path).map(|i| p.entries[i].modified));
-                    if mtime != now {
-                        self.big.remove(&path); // file changed while decoding
-                        continue;
-                    }
+                Msg::Big { path, stamp, res } => {
+                    let now = self.file_stamp(&path);
+                    if stamp != now { continue; }
                     if let Some(b) = self.big.get_mut(&path) {
                         *b = match res {
                             Ok((t, d)) => Big::Ready(t, d),
@@ -1190,10 +1256,12 @@ impl App {
 
     /// Forget cached tree children under `d` and re-read the grid if it shows `d`.
     fn refresh_dir(&mut self, d: &Path) {
+        self.restore_missing_dirs();
         self.tree_children.retain(|k, _| !k.starts_with(d));
         for pi in panes_showing(&self.panes, d) {
             self.reload(pi, None);
         }
+        self.sync_watch_dirs();
     }
 
     fn do_rename(&mut self, path: PathBuf, new_name: &str) {
@@ -3220,6 +3288,7 @@ impl eframe::App for App {
             }
         }
         self.poll_msgs();
+        self.refresh_changed_dirs();
         // Ctrl+V: egui only reports it when the clipboard holds text
         let v = ctx.input(|i| i.focused) && fileops::ctrl_v_down();
         if v && !self.ctrl_v_prev && self.viewer.is_none() && !self.modal_open() && !ctx.wants_keyboard_input() {

@@ -18,6 +18,7 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Shel
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_Graphics_Imaging", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Ole", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_Storage_EnhancedStorage", "Win32_Media_MediaFoundation"] }
 rfd = "0.15"
 rodio = { version = "0.20", features = ["symphonia-aac", "symphonia-isomp4"] }
+notify = { version = "8", default-features = false }
 
 [profile.release]
 opt-level = 3

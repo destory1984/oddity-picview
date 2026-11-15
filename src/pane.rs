@@ -255,10 +255,26 @@ pub fn restore_dir(saved: &Path, fallback: &Path) -> PathBuf {
     saved.ancestors().find(|p| p.is_dir()).unwrap_or(fallback).to_path_buf()
 }
 
+pub fn thumb_still_valid(old_size: u64, old_mtime: SystemTime, new_size: u64, new_mtime: SystemTime) -> bool {
+    old_size == new_size && old_mtime == new_mtime
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use eframe::egui::{self, pos2};
+    #[test] fn thumb_kept_when_unchanged() {
+        let t = SystemTime::UNIX_EPOCH;
+        assert!(thumb_still_valid(10, t, 10, t));
+    }
+    #[test] fn thumb_dropped_when_size_changes() {
+        let t = SystemTime::UNIX_EPOCH;
+        assert!(!thumb_still_valid(10, t, 11, t));
+    }
+    #[test] fn thumb_dropped_when_mtime_changes() {
+        let t = SystemTime::UNIX_EPOCH;
+        assert!(!thumb_still_valid(10, t, 10, t + std::time::Duration::from_secs(1)));
+    }
     fn r(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect { Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)) }
 
     #[test] fn one_is_whole_area() { assert_eq!(pane_rects(r(0.,0.,1000.,600.), Split::One), vec![r(0.,0.,1000.,600.)]); }
@@ -345,6 +361,8 @@ mod tests {
             split: Split::One,
             active: 0,
             ctx: ctx.clone(),
+            watch: None,
+            dir_changes: HashMap::new(),
             tx,
             rx,
             thumb_size: saved.thumb_size.clamp(64.0, 256.0),
@@ -390,6 +408,118 @@ mod tests {
         app
     }
 
+    fn image_file(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        image::RgbaImage::new(2, 3).save(&path).unwrap();
+        path
+    }
+    #[test] fn refresh_preserves_selection_scroll_and_viewer_path() {
+        use crate::*;
+        let t = temp_dir();
+        let b = image_file(&t, "b.png");
+        let c = image_file(&t, "c.png");
+        let mut app = test_app(&t);
+        let bi = app.panes[0].index_of(&b).unwrap();
+        let ci = app.panes[0].index_of(&c).unwrap();
+        app.panes[0].selected = BTreeSet::from([bi, ci]);
+        app.panes[0].focus = Some(ci);
+        app.panes[0].anchor = Some(bi);
+        app.panes[0].grid_offset = 120.;
+        app.viewer = Some(Viewer { pane: 0, idx: ci, zoom: Some(2.), pan: Vec2::ZERO });
+        image_file(&t, "a.png");
+        app.refresh_dir(&t);
+        let pane = &app.panes[0];
+        assert_eq!(pane.selected_paths(), vec![b.clone(), c.clone()]);
+        assert_eq!(pane.anchor, pane.index_of(&b));
+        assert_eq!(pane.grid_offset, 120.);
+        let v = app.viewer.as_ref().unwrap();
+        assert_eq!(pane.entries[v.idx].path, c);
+        assert_eq!(v.zoom, Some(2.));
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn refresh_closes_viewer_when_file_disappears() {
+        use crate::*;
+        let t = temp_dir();
+        let path = image_file(&t, "gone.png");
+        let mut app = test_app(&t);
+        app.viewer = Some(Viewer { pane: 0, idx: 0, zoom: None, pan: Vec2::ZERO });
+        std::fs::remove_file(path).unwrap();
+        app.refresh_dir(&t);
+        assert!(app.viewer.is_none());
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn refresh_reuses_unchanged_thumb_and_drops_changed_caches() {
+        use crate::*;
+        let t = temp_dir();
+        let path = image_file(&t, "changed.png");
+        let mut app = test_app(&t);
+        let tex = app.ctx.load_texture("test", ColorImage::new([2, 3], Color32::WHITE), tex_opts());
+        let id = tex.id();
+        for pane in &mut app.panes { pane.thumbs[0] = Thumb::Ready(tex.clone()); }
+        app.refresh_dir(&t);
+        assert!(matches!(&app.panes[0].thumbs[0], Thumb::Ready(t) if t.id() == id));
+        app.big.insert(path.clone(), Big::Pending);
+        app.anims.insert(path.clone(), Anim { frames: vec![], total: Duration::ZERO, start: Instant::now() });
+        app.clips.insert(path.clone(), Clip::Pending);
+        std::fs::write(&path, b"different size").unwrap();
+        app.refresh_dir(&t);
+        assert!(app.panes.iter().all(|p| matches!(p.thumbs[0], Thumb::None)));
+        assert!(!app.big.contains_key(&path));
+        assert!(!app.anims.contains_key(&path));
+        assert!(!app.clips.contains_key(&path));
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn refresh_restores_removed_folder_to_ancestor() {
+        let t = temp_dir();
+        let child = t.join("child");
+        std::fs::create_dir(&child).unwrap();
+        let mut app = test_app(&child);
+        std::fs::remove_dir(&child).unwrap();
+        app.refresh_dir(&child);
+        assert!(app.panes.iter().all(|p| p.cur_dir == t));
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn stale_media_jobs_cannot_restore_changed_caches() {
+        use crate::*;
+        let t = temp_dir();
+        let path = image_file(&t, "changed.png");
+        let mut app = test_app(&t);
+        let stamp = app.file_stamp(&path);
+        std::fs::write(&path, b"different size").unwrap();
+        app.refresh_dir(&t);
+        app.big.insert(path.clone(), Big::Pending);
+        app.clips.insert(path.clone(), Clip::Pending);
+        app.tx.send(Msg::Big { path: path.clone(), stamp, res: Err("old".into()) }).unwrap();
+        app.tx.send(Msg::Anim { path: path.clone(), stamp, frames: vec![] }).unwrap();
+        app.tx.send(Msg::Clip { path: path.clone(), stamp, frames: None }).unwrap();
+        app.poll_msgs();
+        assert!(matches!(app.big.get(&path), Some(Big::Pending)));
+        assert!(!app.anims.contains_key(&path));
+        assert!(matches!(app.clips.get(&path), Some(Clip::Pending)));
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn auto_refresh_waits_for_dialog_and_drag_then_updates_both_panes() {
+        use crate::*;
+        let t = temp_dir();
+        let mut app = test_app(&t);
+        let path = image_file(&t, "added.png");
+        app.tx.send(Msg::DirChanged { dir: t.clone() }).unwrap();
+        app.poll_msgs();
+        let first = Instant::now() - Duration::from_secs(2);
+        app.dir_changes.insert(t.clone(), (first, first));
+        app.dialog = Some(Dialog::Delete(vec![]));
+        app.refresh_changed_dirs();
+        assert!(app.panes.iter().all(|p| p.index_of(&path).is_none()));
+        app.dialog = None;
+        egui::DragAndDrop::set_payload(&app.ctx, DragFiles(vec![path.clone()]));
+        app.refresh_changed_dirs();
+        assert!(app.panes.iter().all(|p| p.index_of(&path).is_none()));
+        egui::DragAndDrop::clear_payload(&app.ctx);
+        app.refresh_changed_dirs();
+        assert!(app.panes.iter().all(|p| p.index_of(&path).is_some()));
+        assert!(app.dir_changes.is_empty());
+        std::fs::remove_dir_all(t).unwrap();
+    }
     #[test] fn changing_split_keeps_pane_state() {
         let t = temp_dir();
         std::fs::create_dir(t.join("other")).unwrap();
