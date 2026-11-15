@@ -19,10 +19,16 @@ pub struct Icons {
     pub folder: TextureHandle,
     pub star: TextureHandle,
     pub settings: TextureHandle,
+    /// the folder icon in blue, for the ".." (parent folder) cell
+    pub folder_up: TextureHandle,
 }
 
 fn load(ctx: &egui::Context, name: &str, png: &[u8]) -> TextureHandle {
     let img = image::load_from_memory(png).expect("embedded icon").to_rgba8();
+    texture(ctx, name, &img)
+}
+
+fn texture(ctx: &egui::Context, name: &str, img: &image::RgbaImage) -> TextureHandle {
     let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
     ctx.load_texture(
         format!("icon/{name}"),
@@ -33,8 +39,21 @@ fn load(ctx: &egui::Context, name: &str, png: &[u8]) -> TextureHandle {
 
 macro_rules! icons {
     ($ctx:expr, $($name:ident),*) => {
-        Icons { $($name: load($ctx, stringify!($name), include_bytes!(concat!("../assets/icons/", stringify!($name), ".png")))),* }
+        Icons {
+            $($name: load($ctx, stringify!($name), include_bytes!(concat!("../assets/icons/", stringify!($name), ".png"))),)*
+            folder_up: blue_folder($ctx),
+        }
     };
+}
+
+/// The yellow folder with red and blue swapped: a light-blue folder with a
+/// dark-blue outline, so ".." stands apart from the real folders.
+fn blue_folder(ctx: &egui::Context) -> TextureHandle {
+    let mut img = image::load_from_memory(include_bytes!("../assets/icons/folder.png")).expect("embedded icon").to_rgba8();
+    for p in img.pixels_mut() {
+        p.0.swap(0, 2);
+    }
+    texture(ctx, "folder_up", &img)
 }
 
 impl Icons {

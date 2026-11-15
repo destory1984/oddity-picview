@@ -48,20 +48,41 @@ impl GridLayout {
 pub fn cell_of(ts: f32) -> Vec2 {
     vec2(ts + 16.0, ts + 16.0 + 22.0)
 }
-pub fn pane_rects(area: Rect, n: usize) -> Vec<Rect> {
-    let n = n.clamp(1, 4);
-    if n == 1 { return vec![area]; }
-    let cols = if n == 4 { 2 } else { n };
-    let rows = if n == 4 { 2 } else { 1 };
-    let gap = 6.0;
-    let w = (area.width() - gap * (cols - 1) as f32) / cols as f32;
-    let h = (area.height() - gap * (rows - 1) as f32) / rows as f32;
-    (0..n).map(|i| {
-        let min = area.min + vec2((i % cols) as f32 * (w + gap), (i / cols) as f32 * (h + gap));
-        Rect::from_min_size(min, vec2(w, h))
-    }).collect()
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum Split {
+    #[default]
+    One,
+    LeftRight,
+    TopBottom,
 }
 
+impl Split {
+    pub fn len(self) -> usize {
+        match self {
+            Self::One => 1,
+            Self::LeftRight | Self::TopBottom => 2,
+        }
+    }
+}
+
+pub fn pane_rects(area: Rect, split: Split) -> Vec<Rect> {
+    let gap = 6.0;
+    let (size, step) = match split {
+        Split::One => return vec![area],
+        Split::LeftRight => {
+            let w = (area.width() - gap) / 2.0;
+            (vec2(w, area.height()), vec2(w + gap, 0.0))
+        }
+        Split::TopBottom => {
+            let h = (area.height() - gap) / 2.0;
+            (vec2(area.width(), h), vec2(0.0, h + gap))
+        }
+    };
+    vec![
+        Rect::from_min_size(area.min, size),
+        Rect::from_min_size(area.min + step, size),
+    ]
+}
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
@@ -210,7 +231,7 @@ pub struct PaneCountResult {
 }
 
 pub fn shrink_panes(c: PaneCountChange) -> PaneCountResult {
-    let n = c.n.clamp(1, 4);
+    let n = c.n.clamp(1, 2);
     PaneCountResult {
         active: if c.active < n { c.active } else { 0 },
         close_viewer: c.viewer_pane.is_some_and(|pi| pi >= n),
@@ -237,15 +258,30 @@ pub fn restore_dir(saved: &Path, fallback: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui::pos2;
+    use eframe::egui::{self, pos2};
     fn r(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect { Rect::from_min_max(pos2(x0, y0), pos2(x1, y1)) }
 
-    #[test] fn one_pane_is_whole_area()   { assert_eq!(pane_rects(r(0.,0.,1000.,600.), 1), vec![r(0.,0.,1000.,600.)]); }
-    #[test] fn two_panes_split_left_right() { let v = pane_rects(r(0.,0.,1000.,600.), 2); assert_eq!(v.len(), 2); assert!(v[0].max.x <= v[1].min.x); assert_eq!(v[0].height(), 600.); assert!((v[0].width() - v[1].width()).abs() < 0.5); }
-    #[test] fn three_panes_are_columns()  { let v = pane_rects(r(0.,0.,900.,600.), 3); assert!(v.iter().all(|p| p.height() == 600.)); assert!(v[0].max.x <= v[1].min.x && v[1].max.x <= v[2].min.x); }
-    #[test] fn four_panes_are_2x2()       { let v = pane_rects(r(0.,0.,1000.,600.), 4); assert_eq!(v[0].min.y, v[1].min.y); assert!(v[0].max.y <= v[2].min.y); assert_eq!(v[0].min.x, v[2].min.x); }
-    #[test] fn pane_count_is_clamped()    { assert_eq!(pane_rects(r(0.,0.,100.,100.), 0).len(), 1); assert_eq!(pane_rects(r(0.,0.,100.,100.), 9).len(), 4); }
-
+    #[test] fn one_is_whole_area() { assert_eq!(pane_rects(r(0.,0.,1000.,600.), Split::One), vec![r(0.,0.,1000.,600.)]); }
+    #[test] fn left_right_splits_width() {
+        let v = pane_rects(r(0.,0.,1000.,600.), Split::LeftRight);
+        assert_eq!(v.len(), 2);
+        assert!(v[0].max.x <= v[1].min.x);
+        assert!(v.iter().all(|p| p.height() == 600.));
+        assert!((v[0].width() - v[1].width()).abs() < 0.5);
+        assert_eq!(v[1].min.x - v[0].max.x, 6.);
+    }
+    #[test] fn top_bottom_splits_height() {
+        let v = pane_rects(r(0.,0.,1000.,600.), Split::TopBottom);
+        assert_eq!(v.len(), 2);
+        assert!(v[0].max.y <= v[1].min.y);
+        assert!(v.iter().all(|p| p.width() == 1000.));
+        assert!((v[0].height() - v[1].height()).abs() < 0.5);
+        assert_eq!(v[1].min.y - v[0].max.y, 6.);
+    }
+    #[test] fn switching_direction_keeps_two_panes() {
+        assert_eq!(pane_rects(r(0.,0.,1000.,600.), Split::LeftRight).len(), 2);
+        assert_eq!(pane_rects(r(0.,0.,1000.,600.), Split::TopBottom).len(), 2);
+    }
     fn pane_with(n: usize, gen: u64) -> Pane {
         let mut p = Pane::new();
         p.thumbs = (0..n).map(|_| Thumb::None).collect();
@@ -258,7 +294,7 @@ mod tests {
     #[test] fn route_drops_closed_pane()     { let p = pane_with(3, 7); assert!(!route_ok(&[p], 1, 7, 0)); }
     #[test] fn route_rejects_index_past_end(){ let p = pane_with(3, 7); assert!(!route_ok(&[p], 0, 7, 3)); }
     #[test] fn shrinking_closes_viewer_of_removed_pane() {
-        let r = shrink_panes(PaneCountChange { active: 2, viewer_pane: Some(2), n: 1 });
+        let r = shrink_panes(PaneCountChange { active: 1, viewer_pane: Some(1), n: 1 });
         assert_eq!(r.active, 0); assert!(r.close_viewer);
     }
     #[test] fn shrinking_keeps_viewer_of_kept_pane() {
@@ -271,9 +307,9 @@ mod tests {
     #[test] fn drop_on_other_folder() { assert_eq!(drop_dest(p("C:/b"), &[pb("C:/a/1.jpg")]), Some(pb("C:/b"))); }
     #[test] fn drop_folder_into_itself_is_none() { assert_eq!(drop_dest(p("C:/a/sub"), &[pb("C:/a")]), None); }
     #[test] fn panes_showing_finds_every_pane() {
-        let mut panes = vec![Pane::new(), Pane::new(), Pane::new()];
-        for (pane, dir) in panes.iter_mut().zip(["C:/a", "C:/b", "C:/a"]) { pane.cur_dir = pb(dir); }
-        assert_eq!(panes_showing(&panes, p("C:/a")), vec![0, 2]);
+        let mut panes = vec![Pane::new(), Pane::new()];
+        for (pane, dir) in panes.iter_mut().zip(["C:/a", "C:/a"]) { pane.cur_dir = pb(dir); }
+        assert_eq!(panes_showing(&panes, p("C:/a")), vec![0, 1]);
     }
 
     fn temp_dir() -> PathBuf {
@@ -306,6 +342,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut app = App {
             panes: vec![Pane::new()],
+            split: Split::One,
             active: 0,
             ctx: ctx.clone(),
             tx,
@@ -349,10 +386,71 @@ mod tests {
 
 
         app.navigate(0, dir.to_path_buf(), false);
-        app.set_pane_count(2);
+        app.set_split(Split::LeftRight);
         app
     }
 
+    #[test] fn changing_split_keeps_pane_state() {
+        let t = temp_dir();
+        std::fs::create_dir(t.join("other")).unwrap();
+        let mut app = test_app(&t);
+        app.navigate(1, t.join("other"), false);
+        app.activate(1);
+        for (pi, pane) in app.panes.iter_mut().enumerate() {
+            pane.selected.insert(pi);
+            pane.grid_offset = 100.0 + pi as f32;
+        }
+        let generations: Vec<_> = app.panes.iter().map(|p| p.gen.load(Ordering::SeqCst)).collect();
+        for split in [Split::TopBottom, Split::LeftRight] {
+            app.set_split(split);
+            assert_eq!(app.panes.len(), 2);
+            assert_eq!(app.active, 1);
+            assert_eq!(app.panes[0].cur_dir, t);
+            assert_eq!(app.panes[1].cur_dir, t.join("other"));
+            for (pi, pane) in app.panes.iter().enumerate() {
+                assert_eq!(pane.selected, BTreeSet::from([pi]));
+                assert_eq!(pane.grid_offset, 100.0 + pi as f32);
+                assert_eq!(pane.gen.load(Ordering::SeqCst), generations[pi]);
+            }
+        }
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test] fn one_closes_second_pane_and_reopening_uses_active_folder() {
+        let t = temp_dir();
+        let mut app = test_app(&t);
+        let generation = app.panes[1].gen.clone();
+        let before = generation.load(Ordering::SeqCst);
+        app.activate(1);
+        app.viewer = Some(crate::Viewer { pane: 1, idx: 0, zoom: None, pan: Vec2::ZERO });
+        app.set_split(Split::One);
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.active, 0);
+        assert!(app.viewer.is_none());
+        assert_ne!(generation.load(Ordering::SeqCst), before);
+        app.set_split(Split::TopBottom);
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.panes[1].cur_dir, t);
+        assert_ne!(app.panes[1].gen.load(Ordering::SeqCst), before);
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test] fn toolbar_fits_1200_pixels_without_a_window() {
+        let t = temp_dir();
+        let mut app = test_app(&t);
+        let ctx = app.ctx.clone();
+        crate::setup_fonts(&ctx);
+        let _ = ctx.run(egui::RawInput {
+            screen_rect: Some(r(0., 0., 1200., 800.)),
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.toolbar(ui);
+                assert!(ui.min_rect().max.x <= 1200., "toolbar right edge: {}", ui.min_rect().max.x);
+            });
+        });
+        std::fs::remove_dir_all(&t).unwrap();
+    }
     #[test] fn new_folder_updates_every_matching_pane() {
         let t = temp_dir();
         let mut app = test_app(&t);

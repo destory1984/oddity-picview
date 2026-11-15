@@ -141,7 +141,7 @@ const RECENT_MAX: usize = 10;
 struct Settings {
     last_dir: Option<PathBuf>,
     pane_dirs: Vec<PathBuf>,
-    pane_count: usize,
+    split: Split,
     active_pane: usize,
     recent: Vec<PathBuf>,
     sort: SortKey,
@@ -163,7 +163,7 @@ impl Default for Settings {
         Settings {
             last_dir: None,
             pane_dirs: Vec::new(),
-            pane_count: 1,
+            split: Split::One,
             active_pane: 0,
             recent: Vec::new(),
             sort: SortKey::Name,
@@ -209,6 +209,7 @@ enum Dialog {
 
 struct App {
     panes: Vec<Pane>,
+    split: Split,
     active: usize,
     ctx: egui::Context,
 
@@ -278,8 +279,10 @@ impl App {
         self.open_tree_to(&self.panes[pi].cur_dir.clone());
     }
 
-    fn set_pane_count(&mut self, n: usize) {
-        let n = n.clamp(1, 4);
+    fn set_split(&mut self, s: Split) {
+        if self.split == s { return; }
+        self.split = s;
+        let n = s.len();
         let dir = self.pane().cur_dir.clone();
         let result = shrink_panes(PaneCountChange {
             active: self.active, viewer_pane: self.viewer.as_ref().map(|v| v.pane), n,
@@ -318,6 +321,7 @@ impl App {
         std::thread::spawn(move || cache::trim(limit));
         let mut app = App {
             panes: vec![Pane::new()],
+            split: Split::One,
             active: 0,
             ctx: cc.egui_ctx.clone(),
             tx,
@@ -362,7 +366,7 @@ impl App {
         let home = std::env::var("USERPROFILE").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("C:\\"));
         let pics = home.join("Pictures");
         let fallback = if pics.is_dir() { pics } else { restore_dir(&home, Path::new("C:/")) };
-        let n = saved.pane_count.clamp(1, 4);
+        let n = saved.split.len();
         let active = if saved.active_pane < n { saved.active_pane } else { 0 };
         let active_saved = saved.pane_dirs.get(active).or(saved.last_dir.as_ref());
         let mut active_dir = active_saved.map(|d| restore_dir(d, &fallback)).unwrap_or(fallback);
@@ -374,7 +378,7 @@ impl App {
             }
         }
         app.navigate(0, active_dir.clone(), false);
-        app.set_pane_count(n);
+        app.set_split(saved.split);
         for pi in 0..n {
             let dir = if pi == active { active_dir.clone() }
                 else { saved.pane_dirs.get(pi).or(if pi == 0 { saved.last_dir.as_ref() } else { None })
@@ -1035,6 +1039,14 @@ impl App {
                     for d in dirs {
                         self.refresh_dir(&d);
                     }
+                    // a pane may have shown a folder that was just moved away
+                    for pi in 0..self.panes.len() {
+                        let cur = self.panes[pi].cur_dir.clone();
+                        if !cur.as_os_str().is_empty() && !cur.is_dir() {
+                            let fallback = cur.ancestors().last().map(Path::to_path_buf).unwrap_or_default();
+                            self.navigate(pi, restore_dir(&cur, &fallback), false);
+                        }
+                    }
                 }
                 Msg::Big { path, mtime, res } => {
                     let now = self.panes.iter().find_map(|p| p.index_of(&path).map(|i| p.entries[i].modified));
@@ -1532,7 +1544,11 @@ impl App {
         let header = state.show_header(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.add(egui::Image::new(SizedTexture::new(folder, vec2(16.0, 16.0))));
-            let r = ui.selectable_label(selected, label);
+            // a folder can be dragged from the tree like a thumbnail (not drive roots)
+            let r = ui.selectable_label(selected, label).interact(Sense::drag());
+            if r.drag_started() && path.parent().is_some() {
+                r.dnd_set_drag_payload(DragFiles(vec![path.to_path_buf()]));
+            }
             self.drop_target(ui, &r, path);
             if r.clicked() {
                 *nav = Some(path.to_path_buf());
@@ -1826,21 +1842,36 @@ impl App {
                     }
                     ui.separator();
                     self.kind_filter_buttons(ui);
-                    ui.label("칸");
+                    ui.label("패널");
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
                         ui.spacing_mut().button_padding = vec2(6.0, 0.0);
-                        for row in [[1, 2], [3, 4]] {
+                        for row in [
+                            &[(Split::One, "하나", "목록을 하나로 보기")][..],
+                            &[
+                                (Split::LeftRight, "좌우", "목록을 좌우 두 패널로 나누기"),
+                                (Split::TopBottom, "상하", "목록을 위아래 두 패널로 나누기"),
+                            ][..],
+                        ] {
                             ui.horizontal(|ui| {
-                                for n in row {
-                                    let on = self.panes.len() == n;
-                                    let text = egui::RichText::new(n.to_string()).size(12.0)
-                                        .color(if on { Color32::WHITE } else { Color32::from_gray(40) });
-                                    let b = egui::Button::new(text).min_size(vec2(24.0, 18.0))
+                                for &(split, _label, hint) in row {
+                                    // drawn icon instead of text: a box, split the way the panes are
+                                    let on = self.split == split;
+                                    let b = egui::Button::new("").min_size(vec2(26.0, 18.0))
                                         .corner_radius(9.0)
                                         .fill(if on { Color32::from_rgb(40, 120, 220) } else { Color32::from_gray(232) });
-                                    if ui.add(b).on_hover_text(format!("칸 {n}개로 나누기")).clicked() {
-                                        self.set_pane_count(n);
+                                    let resp = ui.add(b);
+                                    let ink = if on { Color32::WHITE } else { Color32::from_gray(60) };
+                                    let r = Rect::from_center_size(resp.rect.center(), vec2(14.0, 10.0));
+                                    let st = Stroke::new(1.2f32, ink);
+                                    ui.painter().rect_stroke(r, 1.0f32, st, egui::StrokeKind::Middle);
+                                    match split {
+                                        Split::LeftRight => { ui.painter().vline(r.center().x, r.y_range(), st); }
+                                        Split::TopBottom => { ui.painter().hline(r.x_range(), r.center().y, st); }
+                                        Split::One => {}
+                                    }
+                                    if resp.on_hover_text(hint).clicked() {
+                                        self.set_split(split);
                                     }
                                 }
                             });
@@ -2183,14 +2214,15 @@ impl App {
         let resp = ui.interact(rect, ui.id().with("cell_up"), Sense::click());
         if resp.clicked() || resp.secondary_clicked() || resp.drag_started() { self.activate(pi); }
         let painter = ui.painter();
-        let bg = if resp.hovered() { Color32::from_rgb(235, 244, 255) } else { Color32::WHITE };
+        // ".." is a way out, not a folder of this list: blue icon on a grey-blue card
+        let bg = if resp.hovered() { Color32::from_rgb(225, 236, 250) } else { Color32::from_rgb(240, 244, 250) };
         painter.rect_filled(rect, 4.0f32, bg);
-        painter.rect_stroke(rect, 4.0f32, Stroke::new(1.0f32, Color32::from_gray(215)), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect, 4.0f32, Stroke::new(1.0f32, Color32::from_rgb(196, 210, 230)), egui::StrokeKind::Inside);
         let ts = rect.width() - 16.0;
         let img_area = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(ts, ts));
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         let fr = Rect::from_center_size(img_area.center(), img_area.size() * 0.60);
-        painter.image(self.icons.folder.id(), fr, uv, Color32::WHITE);
+        painter.image(self.icons.folder_up.id(), fr, uv, Color32::WHITE);
         let ar = Rect::from_center_size(fr.right_bottom() - fr.size() * 0.18, fr.size() * 0.5);
         painter.image(self.icons.up.id(), ar, uv, Color32::WHITE);
         painter.text(
@@ -2515,7 +2547,7 @@ impl App {
                 if self.panes.len() == 1 {
                     self.grid(ui, 0);
                 } else {
-                    for (pi, rect) in pane_rects(ui.max_rect(), self.panes.len()).into_iter().enumerate() {
+                    for (pi, rect) in pane_rects(ui.max_rect(), self.split).into_iter().enumerate() {
                         self.pane_frame(ui, pi, rect);
                     }
                 }
@@ -2754,7 +2786,7 @@ impl App {
         title.append(concat!("v", env!("CARGO_PKG_VERSION")), 6.0, TextFormat {
             font_id: egui::FontId::proportional(12.0), color: muted, valign: Align::BOTTOM, ..Default::default()
         });
-        egui::Window::new(title)
+        let shown = egui::Window::new(title)
             .open(&mut open).collapsible(false).resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .default_width(420.0).frame(frame).show(ctx, |ui| {
@@ -2901,15 +2933,20 @@ impl App {
                             "미리보기 칸, 그리고 마우스를 올린 목록 칸에서 돕니다. 끄면 썸네일 한 장만 보입니다."
                         ).size(12.0).color(muted)).wrap());
                     });
-                // program info lives in its own small window
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                    let image = egui::Image::new((self.icons.view.id(), vec2(16.0, 16.0)));
-                    if ui.add(egui::Button::image_and_text(image, "About")).on_hover_text("프로그램 정보").clicked() {
-                        self.show_about = true;
-                    }
-                });
                 }); // ScrollArea
             });
+        // "About" sits in the title bar, left of the close button; the program
+        // info itself opens in its own small window
+        if let Some(w) = shown {
+            let at = pos2(w.response.rect.right() - 128.0, w.response.rect.top() + 19.0);
+            egui::Area::new(Id::new("settings_about")).order(egui::Order::Foreground).fixed_pos(at).show(ctx, |ui| {
+                let image = egui::Image::new((self.icons.view.id(), vec2(14.0, 14.0)));
+                let b = egui::Button::image_and_text(image, egui::RichText::new("About").size(12.5)).corner_radius(4.0);
+                if ui.add(b).on_hover_text("프로그램 정보").clicked() {
+                    self.show_about = true;
+                }
+            });
+        }
         // Esc goes back to the main screen (the About window on top closes first)
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
         self.show_settings = open && !(esc && !self.show_about);
@@ -3154,7 +3191,7 @@ impl eframe::App for App {
         let s = Settings {
             last_dir: Some(self.panes[0].cur_dir.clone()).filter(|d| !d.as_os_str().is_empty()),
             pane_dirs: self.panes.iter().map(|p| p.cur_dir.clone()).collect(),
-            pane_count: self.panes.len(),
+            split: self.split,
             active_pane: self.active,
             recent: self.recent.clone(),
             sort: self.sort,
@@ -3171,17 +3208,15 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Apply the capture override before the first browser frame.
-        static PANES_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !PANES_SET.swap(true, Ordering::Relaxed) {
-            if let Ok(n) = std::env::var("PICVIEW_PANES") {
-                if let Ok(n @ 2..=4) = n.parse::<usize>() {
-                    let dir = self.pane().cur_dir.clone();
-                    self.set_pane_count(n);
-                    for pi in 0..n {
-                        if self.panes[pi].cur_dir != dir { self.navigate(pi, dir.clone(), false); }
-                    }
-                    self.activate(0);
-                }
+        static SPLIT_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SPLIT_SET.swap(true, Ordering::Relaxed) {
+            let split = match std::env::var("PICVIEW_SPLIT").as_deref() {
+                Ok("lr") => Some(Split::LeftRight),
+                Ok("tb") => Some(Split::TopBottom),
+                _ => None,
+            };
+            if let Some(split) = split {
+                self.set_split(split);
             }
         }
         self.poll_msgs();
