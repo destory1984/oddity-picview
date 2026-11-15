@@ -1957,6 +1957,30 @@ impl App {
         if !ui.rect_contains_pointer(ui.max_rect()) {
             return;
         }
+        // Ctrl+wheel: thumbnail size, 16 px per notch (like Explorer)
+        let zoom: f32 = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::MouseWheel { unit, delta, modifiers } if modifiers.command => Some(match unit {
+                        egui::MouseWheelUnit::Point => delta.y / 50.0,
+                        _ => delta.y,
+                    }),
+                    _ => None,
+                })
+                .sum()
+        });
+        if zoom != 0.0 {
+            self.wheel_acc += zoom;
+            let steps = self.wheel_acc.trunc();
+            self.wheel_acc -= steps;
+            if steps != 0.0 {
+                self.thumb_size = (self.thumb_size + steps * 16.0).clamp(64.0, 256.0);
+                if let Some(f) = self.focus {
+                    self.ensure_visible(f);
+                }
+            }
+        }
         let pitch = self.cell_size().y + GAP;
         let page_rows = (self.grid_view_h / pitch).floor().max(1.0);
         let notches: f32 = ui.input(|i| {
