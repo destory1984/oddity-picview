@@ -211,6 +211,8 @@ pub fn wic_decode(path: &Path, max_side: u32) -> Result<(image::RgbaImage, [u32;
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
 
     let wpath = wide(path.as_os_str());
+    let mut archive_bytes = crate::archive::split(path)
+        .map(|(archive, name)| crate::archive::read_entry(&archive, &name)).transpose()?;
     let err = |e: windows::core::Error| {
         if e.code().0 as u32 == 0x88982F50 {
             "이 형식을 읽을 코덱이 없습니다 (Microsoft Store의 HEIF / Raw 이미지 확장 필요)".to_string()
@@ -221,9 +223,13 @@ pub fn wic_decode(path: &Path, max_side: u32) -> Result<(image::RgbaImage, [u32;
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).map_err(err)?;
-        let decoder = factory
-            .CreateDecoderFromFilename(PCWSTR(wpath.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
-            .map_err(err)?;
+        let stream = factory.CreateStream().map_err(err)?;
+        let decoder = if let Some(bytes) = archive_bytes.as_mut() {
+            stream.InitializeFromMemory(bytes).map_err(err)?;
+            factory.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand).map_err(err)?
+        } else {
+            factory.CreateDecoderFromFilename(PCWSTR(wpath.as_ptr()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand).map_err(err)?
+        };
         let frame = decoder.GetFrame(0).map_err(err)?;
         let (mut w, mut h) = (0u32, 0u32);
         frame.GetSize(&mut w, &mut h).map_err(err)?;
@@ -286,7 +292,7 @@ mod tests {
 /// programs (browser, Explorer, chat apps). Blocks until the drop ends; call on
 /// the UI thread (winit has already set it up for OLE). Returns the effect the
 /// target chose: 0 = cancelled, 1 = copy, 2 = move, 4 = link.
-pub fn drag_out(paths: &[PathBuf]) -> Result<u32, String> {
+pub fn drag_out(hwnd: windows::Win32::Foundation::HWND, paths: &[PathBuf]) -> Result<u32, String> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Com::IDataObject;
     use windows::Win32::System::Ole::{DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK};
@@ -294,8 +300,6 @@ pub fn drag_out(paths: &[PathBuf]) -> Result<u32, String> {
     use windows::Win32::UI::Shell::{
         BHID_DataObject, ILCreateFromPathW, ILFree, IShellItemArray, SHCreateShellItemArrayFromIDLists, SHDoDragDrop,
     };
-    use windows::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 
     let mut pidls: Vec<*const ITEMIDLIST> = Vec::new();
     for p in paths {
@@ -314,7 +318,6 @@ pub fn drag_out(paths: &[PathBuf]) -> Result<u32, String> {
             let items: IShellItemArray = SHCreateShellItemArrayFromIDLists(&pidls)?;
             let data: IDataObject = items.BindToHandler(None, &BHID_DataObject)?;
             // copy or link only: a browser or chat app must never "move" (delete) the original
-            let hwnd = HWND(GetActiveWindow());
             let effect: DROPEFFECT = SHDoDragDrop(Some(hwnd), &data, None, DROPEFFECT_COPY | DROPEFFECT_LINK)?;
             Ok(effect.0)
         })()
@@ -327,13 +330,11 @@ pub fn drag_out(paths: &[PathBuf]) -> Result<u32, String> {
 
 /// After an OLE drag loop the window never sees the left button come up, so
 /// egui would think it is still held. Post the release ourselves.
-pub fn post_left_button_up() {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+pub fn post_left_button_up(hwnd: windows::Win32::Foundation::HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_LBUTTONUP};
     unsafe {
-        let h = GetActiveWindow();
-        if !h.is_null() {
-            PostMessageW(h, WM_LBUTTONUP, 0, 0);
+        if !hwnd.0.is_null() {
+            PostMessageW(hwnd.0, WM_LBUTTONUP, 0, 0);
         }
     }
 }

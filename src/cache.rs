@@ -40,7 +40,10 @@ fn fnv(data: &[u8], mut h: u64) -> u64 {
 }
 
 fn key(path: &Path, size: u64, modified: SystemTime) -> u64 {
-    let p = path.to_string_lossy().to_lowercase();
+    let p = match crate::archive::split(path) {
+        Some((archive, name)) => format!("{}/{}", archive.to_string_lossy().to_lowercase(), name),
+        None => path.to_string_lossy().to_lowercase(),
+    };
     let t = modified.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let mut h = fnv(p.as_bytes(), 0xcbf29ce484222325);
     h = fnv(&size.to_le_bytes(), h);
@@ -162,6 +165,17 @@ pub fn clear() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_key_preserves_case_and_uses_archive_stamp() {
+        let dir = std::env::temp_dir().join(format!("picview-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("book.cbz"); std::fs::write(&archive, b"archive").unwrap();
+        let t = SystemTime::UNIX_EPOCH;
+        assert_ne!(key(&archive.join("Page.png"), 7, t), key(&archive.join("page.png"), 7, t));
+        assert_ne!(key(&archive.join("Page.png"), 7, t), key(&archive.join("Page.png"), 8, t));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn roundtrip_opaque_and_alpha() {

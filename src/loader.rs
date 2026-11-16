@@ -53,6 +53,14 @@ pub fn is_image(path: &Path) -> bool {
     ext_in(path, IMG_EXTS) || is_wic(path)
 }
 
+pub fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    if let Some((archive, name)) = crate::archive::split(path) {
+        crate::archive::read_entry(&archive, &name)
+    } else {
+        std::fs::read(path).map_err(|e| e.to_string())
+    }
+}
+
 /// Rotate / mirror decoded pixels by an EXIF orientation value.
 pub fn orient(img: RgbaImage, dims: [u32; 2], o: Option<u8>) -> (RgbaImage, [u32; 2]) {
     match o.filter(|&v| v > 1).and_then(image::metadata::Orientation::from_exif) {
@@ -71,7 +79,7 @@ pub fn orient(img: RgbaImage, dims: [u32; 2], o: Option<u8>) -> (RgbaImage, [u32
 pub fn load_gif_frames(path: &Path, max_side: u32) -> Option<Vec<(RgbaImage, std::time::Duration)>> {
     use image::AnimationDecoder;
     const MAX_BYTES: usize = 512 * 1024 * 1024;
-    let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let file = Cursor::new(read_bytes(path).ok()?);
     let dec = image::codecs::gif::GifDecoder::new(file).ok()?;
     let mut out = Vec::new();
     let mut bytes = 0usize;
@@ -132,7 +140,10 @@ fn decode_jpeg_scaled(bytes: &[u8], max: u32) -> Option<DynamicImage> {
 }
 
 pub fn make_thumb(path: &Path) -> Result<RgbaImage, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if is_wic(path) {
+        return crate::fileops::wic_decode(path, THUMB_MAX).map(|(img, dims, o)| orient(img, dims, o).0);
+    }
+    let bytes = read_bytes(path)?;
     let orient = exif_orientation(&bytes);
     let img = if is_jpeg(&bytes) {
         match decode_jpeg_scaled(&bytes, THUMB_MAX) {
@@ -156,7 +167,10 @@ pub fn make_thumb(path: &Path) -> Result<RgbaImage, String> {
 /// Full decode for the preview / viewer. Returns the image (downscaled to fit
 /// `max_side` if needed) and the original oriented size.
 pub fn load_full(path: &Path, max_side: u32) -> Result<(RgbaImage, [u32; 2]), String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if is_wic(path) {
+        return crate::fileops::wic_decode(path, max_side).map(|(img, dims, o)| orient(img, dims, o));
+    }
+    let bytes = read_bytes(path)?;
     let orient = exif_orientation(&bytes);
     let mut img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
     if let Some(o) = orient {

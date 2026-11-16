@@ -95,7 +95,7 @@ pub struct Entry {
 
 impl Entry {
     pub fn is_img(&self) -> bool {
-        !self.is_dir && self.media.is_none()
+        !self.is_dir && self.media.is_none() && !crate::archive::is_archive(&self.path)
     }
 }
 
@@ -107,6 +107,10 @@ pub enum Thumb {
 }
 
 pub struct Pane {
+    pub archive_images: Option<Vec<crate::archive::ArchiveEntry>>,
+    pub archive_stamp: Option<(u64, SystemTime)>,
+    pub archive_loading: bool,
+    pub archive_request: u64,
     pub cur_dir: PathBuf,
     pub addr_text: String,
     pub entries: Vec<Entry>,
@@ -139,6 +143,10 @@ pub struct Pane {
 impl Pane {
     pub fn new() -> Pane {
         Pane {
+            archive_images: None,
+            archive_stamp: None,
+            archive_loading: false,
+            archive_request: 0,
             cur_dir: PathBuf::new(),
             addr_text: String::new(),
             entries: Vec::new(),
@@ -252,7 +260,7 @@ pub fn panes_showing(panes: &[Pane], dir: &Path) -> Vec<usize> {
 }
 
 pub fn restore_dir(saved: &Path, fallback: &Path) -> PathBuf {
-    saved.ancestors().find(|p| p.is_dir()).unwrap_or(fallback).to_path_buf()
+    saved.ancestors().find(|p| p.is_dir() || (crate::archive::is_archive(p) && p.is_file())).unwrap_or(fallback).to_path_buf()
 }
 
 pub fn thumb_still_valid(old_size: u64, old_mtime: SystemTime, new_size: u64, new_mtime: SystemTime) -> bool {
@@ -357,6 +365,8 @@ mod tests {
         let drives = Vec::new();
         let (tx, rx) = mpsc::channel();
         let mut app = App {
+            archive_catalog: Arc::default(),
+            hwnd: windows::Win32::Foundation::HWND::default(),
             panes: vec![Pane::new()],
             split: Split::One,
             active: 0,
@@ -600,6 +610,101 @@ mod tests {
         assert_eq!(seen, vec![true, true]);
     }
 
+    fn book(path: &Path, names: &[&str]) {
+        use std::io::{Cursor, Write};
+        let mut bytes = Cursor::new(Vec::new());
+        image::RgbaImage::new(2, 3).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for name in names {
+            w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(bytes.get_ref()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+    fn wait_book(app: &mut crate::App, pi: usize) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.panes[pi].archive_loading && Instant::now() < deadline {
+            app.poll_msgs();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!app.panes[pi].archive_loading, "archive listing timed out");
+    }
+    #[test] fn archive_navigation_history_filter_and_last_page() {
+        use crate::*;
+        let t = temp_dir(); let p = t.join("book.cbz");
+        book(&p, &["10.png", "2.png", "sub/1.png"]);
+        let mut app = test_app(&t);
+        assert_eq!(app.panes[0].kind_counts, [1, 1, 0, 0]);
+        let i = app.panes[0].index_of(&p).unwrap(); app.open_entry(0, i);
+        assert!(app.panes[0].archive_loading);
+        wait_book(&mut app, 0);
+        assert_eq!(app.panes[0].entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["2.png", "10.png", "sub/1.png"]);
+        assert_eq!(app.neighbor_image(0, 2, 1), None);
+        app.open_entry(0, 0); assert_eq!(app.viewer.as_ref().unwrap().pane, 0); app.close_viewer();
+        app.set_kind_filter(KindFilter::Video); assert!(app.panes[0].entries.is_empty());
+        app.set_kind_filter(KindFilter::Image); assert_eq!(app.panes[0].entries.len(), 3);
+        assert!(!app.panes[0].archive_loading);
+        app.go_up(); assert_eq!(app.panes[0].selected_paths(), [p.clone()]);
+        app.go_back(); wait_book(&mut app, 0); assert_eq!(app.panes[0].cur_dir, p);
+        assert_eq!(restore_dir(&p, &t), p);
+        app.go_fwd(); assert_eq!(app.panes[0].cur_dir, t);
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn archive_blocks_mutations_and_reuses_preview_dimensions() {
+        use crate::*;
+        let t = temp_dir(); let p = t.join("book.cbz"); book(&p, &["1.png", "2.png"]);
+        let before = std::fs::read(&p).unwrap();
+        let mut app = test_app(&t); app.navigate(0, p.clone(), true); wait_book(&mut app, 0);
+        let inside = app.panes[0].entries[0].path.clone();
+        for action in [Action::Delete(vec![inside.clone()]), Action::Rename(inside.clone()),
+            Action::Cut(vec![inside.clone()]), Action::Copy(vec![inside.clone()]), Action::Paste(p.clone()),
+            Action::NewFolder(p.clone()), Action::Rotate(vec![inside.clone()], 1),
+            Action::Transfer(vec![inside.clone()], t.clone(), true)] {
+            app.status.clear(); app.run(action);
+            assert_eq!(app.status, "압축 파일 안에서는 할 수 없습니다"); assert!(app.dialog.is_none());
+        }
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        let tex = app.ctx.load_texture("archive-preview", ColorImage::new([2, 3], Color32::WHITE), tex_opts());
+        app.big.insert(inside, Big::Ready(tex, [2, 3]));
+        app.select_single(0, 1); app.select_single(0, 0);
+        assert_eq!(app.panes[0].focus_dims, Some([2, 3]));
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn archive_refresh_tracks_parent_changes_and_deletion() {
+        use crate::*;
+        let t = temp_dir(); let p = t.join("book.cbz"); book(&p, &["1.png"]);
+        let mut app = test_app(&t); app.navigate(0, p.clone(), true); wait_book(&mut app, 0);
+        book(&p, &["1.png", "2.png"]);
+        app.tx.send(Msg::DirChanged { dir: t.clone() }).unwrap(); app.poll_msgs();
+        assert!(app.dir_changes.contains_key(&t));
+        app.refresh_dir(&t); wait_book(&mut app, 0); assert_eq!(app.panes[0].entries.len(), 2);
+        std::fs::remove_file(&p).unwrap(); app.refresh_dir(&t);
+        assert_eq!(app.panes[0].cur_dir, t);
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn archive_cover_and_virtual_image_use_background_loaders() {
+        use crate::*;
+        let t = temp_dir(); let p = t.join("book.cbz"); book(&p, &["1.png"]);
+        let mut app = test_app(&t); let i = app.panes[0].index_of(&p).unwrap(); app.request_thumb(0, i);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(app.panes[0].thumbs[i], Thumb::Pending) && Instant::now() < deadline {
+            app.poll_msgs(); std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(&app.panes[0].thumbs[i], Thumb::Ready(_)));
+        let inside = p.join("1.png");
+        assert_eq!(loader::make_thumb(&inside).unwrap().dimensions(), (2, 3));
+        assert_eq!(loader::load_full(&inside, 100).unwrap().1, [2, 3]);
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn directory_with_archive_extension_stays_writable_and_watched() {
+        use crate::*;
+        let t = temp_dir(); let dir = t.join("photos.zip"); std::fs::create_dir(&dir).unwrap();
+        let mut app = test_app(&dir);
+        assert_eq!(watch_dir(&dir), dir);
+        app.run(Action::NewFolder(dir.clone())); assert!(app.dialog.is_some()); app.dialog = None;
+        app.do_new_folder(dir.clone(), "child"); assert!(dir.join("child").is_dir());
+        std::fs::remove_dir_all(t).unwrap();
+    }
     #[test] fn rotation_updates_every_loaded_thumbnail() {
         use crate::*;
         let t = temp_dir();

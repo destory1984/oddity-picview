@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
+mod archive;
 mod cache;
 mod fileops;
 mod icons;
@@ -8,8 +9,10 @@ mod loader;
 mod rotate;
 mod pane;
 mod watch;
+mod shellmenu;
 
 use pane::*;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use eframe::egui::{
     self, collapsing_header::CollapsingState, load::SizedTexture, pos2, text::LayoutJob, vec2,
@@ -68,7 +71,7 @@ impl KindFilter {
         e.is_dir
             || match self {
                 KindFilter::All => true,
-                KindFilter::Image => e.is_img(),
+                KindFilter::Image => e.is_img() || archive::is_archive(&e.path),
                 KindFilter::Video => e.media == Some(loader::Media::Video),
                 KindFilter::Audio => e.media == Some(loader::Media::Audio),
             }
@@ -82,6 +85,7 @@ enum Big {
 }
 
 enum Msg {
+    ArchiveListed { pane: usize, request: u64, path: PathBuf, stamp: Option<(u64, SystemTime)>, res: Result<Vec<archive::ArchiveEntry>, String> },
     DirChanged { dir: PathBuf },
     Thumb { pane: usize, gen: u64, idx: usize, mtime: SystemTime, tex: TextureHandle },
     ThumbFail { pane: usize, gen: u64, idx: usize },
@@ -210,6 +214,8 @@ enum Dialog {
 // ---------------------------------------------------------------- app
 
 struct App {
+    archive_catalog: ArchiveCatalog,
+    hwnd: windows::Win32::Foundation::HWND,
     panes: Vec<Pane>,
     split: Split,
     active: usize,
@@ -270,7 +276,44 @@ struct App {
     kind_filter: KindFilter,
 }
 
+struct ArchiveListing {
+    stamp: Option<(u64, SystemTime)>,
+    images: std::sync::OnceLock<Result<Vec<archive::ArchiveEntry>, String>>,
+}
+type ArchiveCatalog = Arc<std::sync::Mutex<HashMap<PathBuf, Arc<ArchiveListing>>>>;
+
+fn archive_stamp(path: &Path) -> Option<(u64, SystemTime)> {
+    std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+}
+
+fn watch_dir(path: &Path) -> PathBuf {
+    if archive::is_location(path) { path.parent().unwrap_or(path).to_path_buf() }
+    else { path.to_path_buf() }
+}
+
+fn archive_read_only(path: &Path) -> bool {
+    archive::split(path).is_some()
+}
+
+fn cached_archive(catalog: &ArchiveCatalog, path: &Path) -> Result<Vec<archive::ArchiveEntry>, String> {
+    let stamp = archive_stamp(path);
+    let listing = {
+        let mut cache = catalog.lock().map_err(|_| "압축 파일을 읽을 수 없습니다: 목록 잠금 실패".to_string())?;
+        if cache.get(path).is_some_and(|old| old.stamp != stamp) { cache.remove(path); }
+        if cache.len() >= 128 && !cache.contains_key(path) { cache.clear(); }
+        cache.entry(path.to_path_buf()).or_insert_with(|| Arc::new(ArchiveListing {
+            stamp, images: std::sync::OnceLock::new(),
+        })).clone()
+    };
+    listing.images.get_or_init(|| archive::list_images(path)).clone()
+}
+
 impl App {
+    fn reject_archive(&mut self, paths: &[PathBuf]) -> bool {
+        let blocked = paths.iter().any(|p| archive_read_only(p));
+        if blocked { self.status = "압축 파일 안에서는 할 수 없습니다".into(); }
+        blocked
+    }
     fn pane(&self) -> &Pane { &self.panes[self.active] }
 
     fn pane_mut(&mut self) -> &mut Pane { &mut self.panes[self.active] }
@@ -311,6 +354,12 @@ impl App {
     }
 
     fn new(cc: &eframe::CreationContext<'_>, start: Option<PathBuf>) -> Self {
+        let hwnd = match cc.window_handle().expect("main window handle").as_raw() {
+            RawWindowHandle::Win32(handle) => {
+                windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut std::ffi::c_void)
+            }
+            _ => panic!("expected a Win32 window handle"),
+        };
         setup_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         icons::apply_menu_frame(&cc.egui_ctx);
@@ -325,6 +374,8 @@ impl App {
         let limit = saved.cache_max_mb.clamp(CACHE_MIN_MB, CACHE_MAX_MB) * 1024 * 1024;
         std::thread::spawn(move || cache::trim(limit));
         let mut app = App {
+            archive_catalog: Arc::default(),
+            hwnd,
             panes: vec![Pane::new()],
             split: Split::One,
             active: 0,
@@ -379,7 +430,7 @@ impl App {
         let mut active_dir = active_saved.map(|d| restore_dir(d, &fallback)).unwrap_or(fallback);
         let start = start.map(normalize);
         if let Some(p) = start.as_ref() {
-            if p.is_dir() { active_dir = p.clone(); }
+            if p.is_dir() || (archive::is_archive(p) && p.is_file()) { active_dir = p.clone(); }
             else if p.is_file() {
                 if let Some(parent) = p.parent() { active_dir = parent.to_path_buf(); }
             }
@@ -394,7 +445,7 @@ impl App {
         }
         app.activate(active);
         app.open_tree_to(&app.pane().cur_dir.clone());
-        if let Some(p) = start.filter(|p| p.is_file()) {
+        if let Some(p) = start.filter(|p| p.is_file() && !archive::is_archive(p)) {
             if let Some(i) = app.pane().index_of(&p) {
                 app.select_single(app.active, i);
                 app.viewer = Some(Viewer { pane: app.active, idx: i, zoom: None, pan: Vec2::ZERO });
@@ -408,7 +459,8 @@ impl App {
     fn navigate(&mut self, pi: usize, dir: PathBuf, push_history: bool) {
         if pi == self.active { self.player = None; }
         let dir = normalize(dir);
-        let entries = match self.list_filtered(pi, &dir) {
+        let in_archive = archive::is_archive(&dir) && dir.is_file();
+        let entries = match if in_archive { Ok(Vec::new()) } else { self.list_filtered(pi, &dir) } {
             Ok(e) => e,
             Err(e) => {
                 self.status = format!("폴더를 열 수 없습니다: {e}");
@@ -425,6 +477,10 @@ impl App {
         self.recent.insert(0, dir.clone());
         self.recent.truncate(RECENT_MAX);
         self.panes[pi].cur_dir = dir.clone();
+        self.panes[pi].archive_images = None;
+        self.panes[pi].archive_stamp = None;
+        self.panes[pi].archive_loading = false;
+        self.panes[pi].archive_request = 0;
         self.panes[pi].addr_text = dir.display().to_string();
         self.panes[pi].entries = entries;
         self.panes[pi].thumbs = (0..self.panes[pi].entries.len()).map(|_| Thumb::None).collect();
@@ -438,11 +494,40 @@ impl App {
         self.panes[pi].grid_scroll_to = Some(0.0);
         if pi == self.active { self.open_tree_to(&dir); }
         self.sync_watch_dirs();
+        if in_archive { self.start_archive_list(pi); }
+    }
+
+    fn start_archive_list(&mut self, pi: usize) {
+        let path = self.panes[pi].cur_dir.clone();
+        self.big.retain(|p, _| !p.starts_with(&path));
+        self.big_order.retain(|p| !p.starts_with(&path));
+        self.anims.retain(|p, _| !p.starts_with(&path));
+        self.panes[pi].thumbs = (0..self.panes[pi].entries.len()).map(|_| Thumb::None).collect();
+        self.panes[pi].thumbs_loaded = 0;
+        self.panes[pi].gen.fetch_add(1, Ordering::SeqCst);
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let pane = &mut self.panes[pi];
+        pane.archive_request = NEXT.fetch_add(1, Ordering::Relaxed);
+        pane.archive_loading = true;
+        pane.archive_stamp = archive_stamp(&pane.cur_dir);
+        if pane.entries.is_empty() { pane.kind_counts = [0; 4]; }
+        let (path, stamp, request) = (pane.cur_dir.clone(), pane.archive_stamp, pane.archive_request);
+        let (tx, ctx, catalog) = (self.tx.clone(), self.ctx.clone(), self.archive_catalog.clone());
+        rayon::spawn(move || {
+            let res = cached_archive(&catalog, &path);
+            let _ = tx.send(Msg::ArchiveListed { pane: pi, request, path, stamp, res });
+            ctx.request_repaint();
+        });
     }
 
     /// List a folder, count each kind, and keep only the kind picked in the filter.
     fn list_filtered(&mut self, pi: usize, dir: &Path) -> std::io::Result<Vec<Entry>> {
-        let mut v = list_dir(dir)?;
+        let mut v = if archive::is_archive(dir) && dir.is_file() {
+            let modified = self.panes[pi].archive_stamp.map(|s| s.1).unwrap_or(SystemTime::UNIX_EPOCH);
+            self.panes[pi].archive_images.as_deref().unwrap_or_default().iter().map(|e| Entry {
+                path: dir.join(&e.name), name: e.name.clone(), is_dir: false, media: None, size: e.size, modified,
+            }).collect()
+        } else { list_dir(dir)? };
         let files = v.iter().filter(|e| !e.is_dir);
         self.panes[pi].kind_counts = [0; 4];
         for e in files {
@@ -470,7 +555,7 @@ impl App {
     }
 
     fn sync_watch_dirs(&mut self) {
-        let dirs: Vec<_> = self.panes.iter().map(|p| p.cur_dir.clone()).collect();
+        let dirs: Vec<_> = self.panes.iter().map(|p| watch_dir(&p.cur_dir)).collect();
         self.dir_changes.retain(|d, _| dirs.contains(d));
         if let Some(watch) = &mut self.watch { watch.set_dirs(&dirs); }
     }
@@ -497,7 +582,7 @@ impl App {
     fn restore_missing_dirs(&mut self) {
         for pi in 0..self.panes.len() {
             let cur = self.panes[pi].cur_dir.clone();
-            if !cur.as_os_str().is_empty() && !cur.is_dir() {
+            if !cur.as_os_str().is_empty() && !cur.is_dir() && !(archive::is_archive(&cur) && cur.is_file()) {
                 if self.viewer.as_ref().is_some_and(|v| v.pane == pi) { self.viewer = None; }
                 let fallback = cur.ancestors().last().map(Path::to_path_buf).unwrap_or_default();
                 self.navigate(pi, restore_dir(&cur, &fallback), false);
@@ -507,6 +592,12 @@ impl App {
 
     /// Re-read the current folder, keeping unchanged textures and paths.
     fn reload(&mut self, pi: usize, focus_path: Option<PathBuf>) {
+        let pane = &self.panes[pi];
+        if archive::is_archive(&pane.cur_dir) && pane.cur_dir.is_file()
+            && (pane.archive_images.is_none() || pane.archive_stamp != archive_stamp(&pane.cur_dir)) {
+            if !pane.archive_loading || pane.archive_stamp != archive_stamp(&pane.cur_dir) { self.start_archive_list(pi); }
+            return;
+        }
         let Ok(entries) = self.list_filtered(pi, &self.panes[pi].cur_dir.clone()) else { return };
         let pane = &mut self.panes[pi];
         let selected: Vec<_> = pane.selected.iter().filter_map(|&i| pane.entries.get(i)).map(|e| e.path.clone()).collect();
@@ -599,7 +690,7 @@ impl App {
 
     fn open_address(&mut self) {
         let p = PathBuf::from(self.panes[self.active].addr_text.trim().trim_matches('"'));
-        if p.is_file() {
+        if p.is_file() && !archive::is_archive(&p) {
             let p = normalize(p);
             if let Some(parent) = p.parent() {
                 self.navigate(self.active, parent.to_path_buf(), true);
@@ -686,7 +777,7 @@ impl App {
 
     fn open_entry(&mut self, pi: usize, i: usize) {
         let Some(e) = self.panes[pi].entries.get(i) else { return };
-        if e.is_dir {
+        if e.is_dir || archive::is_archive(&e.path) {
             let p = e.path.clone();
             self.navigate(pi, p, true);
         } else if e.media.is_some() {
@@ -734,11 +825,13 @@ impl App {
         if self.panes[pi].focus != Some(i) {
             self.panes[pi].focus = Some(i);
             self.panes[pi].focus_time = Instant::now();
-            self.panes[pi].focus_dims = self.panes[pi].entries
+            self.panes[pi].focus_dims = self.panes[pi].entries.get(i)
+                .and_then(|e| match self.big.get(&e.path) { Some(Big::Ready(_, dims)) => Some(*dims), _ => None })
+                .or_else(|| self.panes[pi].entries
                 .get(i)
-                .filter(|e| e.is_img())
+                .filter(|e| e.is_img() && archive::split(&e.path).is_none())
                 .and_then(|e| image::image_dimensions(&e.path).ok())
-                .map(|(w, h)| [w, h]);
+                .map(|(w, h)| [w, h]));
         }
     }
 
@@ -894,6 +987,7 @@ impl App {
 
     /// Show the turn at once, then write it to the file in the background.
     fn rotate_paths(&mut self, paths: Vec<PathBuf>, d: i32) {
+        if self.reject_archive(&paths) { return; }
         for p in paths {
             if !loader::is_image(&p) {
                 continue;
@@ -905,6 +999,7 @@ impl App {
     }
 
     fn save_rotation(&mut self, p: &Path) {
+        if self.reject_archive(&[p.to_path_buf()]) { return; }
         let turns = self.rot_of(p);
         if turns == 0 || self.rot_saving.contains_key(p) {
             return; // nothing to do, or a save is running and will pick up the rest
@@ -964,12 +1059,13 @@ impl App {
             return;
         }
         // video, audio, HEIC and RAW: the shell's thumbnail (RAW has a fast embedded preview)
-        let shell = e.media.is_some() || loader::is_wic(&e.path);
+        let shell = e.media.is_some() || (loader::is_wic(&e.path) && archive::split(&e.path).is_none());
         let (path, size, modified, media) = (e.path.clone(), e.size, e.modified, shell);
         self.panes[pi].thumbs[i] = Thumb::Pending;
         let gen = self.panes[pi].gen.load(Ordering::SeqCst);
         let (gen_now, vs, ve) = (self.panes[pi].gen.clone(), self.panes[pi].vis_start.clone(), self.panes[pi].vis_end.clone());
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let catalog = self.archive_catalog.clone();
         rayon::spawn(move || {
             if gen_now.load(Ordering::SeqCst) != gen {
                 return;
@@ -981,15 +1077,21 @@ impl App {
                 ctx.request_repaint();
                 return;
             }
-            let made = match cache::load(&path, size, modified) {
+            let cache_stamp = archive::split(&path).and_then(|(a, _)| archive_stamp(&a)).unwrap_or((size, modified));
+            let made = match cache::load(&path, cache_stamp.0, cache_stamp.1) {
                 Some(img) => Ok(img),
                 None => {
                     let made = if media {
                         fileops::shell_thumbnail(&path, loader::THUMB_MAX as i32)
+                    } else if archive::is_archive(&path) {
+                        cached_archive(&catalog, &path).and_then(|entries| {
+                            entries.first().ok_or_else(|| "그림 없음".to_string())
+                                .and_then(|e| loader::make_thumb(&path.join(&e.name)))
+                        })
                     } else {
                         loader::make_thumb(&path)
                     };
-                    made.inspect(|img| cache::store(&path, size, modified, img))
+                    made.inspect(|img| cache::store(&path, cache_stamp.0, cache_stamp.1, img))
                 }
             };
             let msg = match made {
@@ -1006,6 +1108,7 @@ impl App {
     }
 
     fn file_stamp(&self, path: &Path) -> Option<(u64, SystemTime)> {
+        if let Some((a, _)) = archive::split(path) { return archive_stamp(&a); }
         self.panes.iter().find_map(|p| p.index_of(path).map(|i| (p.entries[i].size, p.entries[i].modified)))
     }
 
@@ -1030,7 +1133,7 @@ impl App {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let max_side = ctx.input(|i| i.max_texture_side).min(16384) as u32;
         std::thread::spawn(move || {
-            let decoded = if loader::is_wic(&path) {
+            let decoded = if loader::is_wic(&path) && archive::split(&path).is_none() {
                 fileops::wic_decode(&path, max_side).map(|(img, dims, o)| loader::orient(img, dims, o))
             } else {
                 loader::load_full(&path, max_side)
@@ -1064,8 +1167,20 @@ impl App {
     fn poll_msgs(&mut self) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
+                Msg::ArchiveListed { pane, request, path, stamp, res } => {
+                    if !self.panes.get(pane).is_some_and(|p| p.cur_dir == path && p.archive_request == request) { continue; }
+                    if stamp != archive_stamp(&path) {
+                        self.restore_missing_dirs();
+                        if self.panes[pane].cur_dir == path { self.start_archive_list(pane); }
+                        continue;
+                    }
+                    self.panes[pane].archive_loading = false;
+                    self.panes[pane].archive_images = Some(res.as_ref().cloned().unwrap_or_default());
+                    self.reload(pane, None);
+                    if let Err(e) = res { self.status = e; }
+                }
                 Msg::DirChanged { dir } => {
-                    if self.panes.iter().any(|p| p.cur_dir == dir) {
+                    if self.panes.iter().any(|p| watch_dir(&p.cur_dir) == dir) {
                         let now = Instant::now();
                         self.dir_changes.entry(dir).and_modify(|times| times.1 = now).or_insert((now, now));
                     }
@@ -1120,6 +1235,11 @@ impl App {
                 Msg::Big { path, stamp, res } => {
                     let now = self.file_stamp(&path);
                     if stamp != now { continue; }
+                    if let Ok((_, dims)) = &res {
+                        for pane in &mut self.panes {
+                            if pane.focus.and_then(|i| pane.entries.get(i)).is_some_and(|e| e.path == path) { pane.focus_dims = Some(*dims); }
+                        }
+                    }
                     if let Some(b) = self.big.get_mut(&path) {
                         *b = match res {
                             Ok((t, d)) => Big::Ready(t, d),
@@ -1156,6 +1276,7 @@ impl App {
     // ------------------------------------------------------------ file ops
 
     fn ask_delete(&mut self, paths: Vec<PathBuf>) {
+        if self.reject_archive(&paths) { return; }
         // drive roots cannot go to the recycle bin
         let paths: Vec<PathBuf> = paths.into_iter().filter(|p| p.exists() && p.parent().is_some()).collect();
         if paths.is_empty() {
@@ -1169,6 +1290,7 @@ impl App {
     }
 
     fn do_delete(&mut self, paths: Vec<PathBuf>) {
+        if self.reject_archive(&paths) { return; }
         match trash::delete_all(&paths) {
             Ok(()) => self.status = format!("{}개 항목을 휴지통으로 보냈습니다", paths.len()),
             Err(e) => self.status = format!("삭제 실패: {e}"),
@@ -1213,12 +1335,16 @@ impl App {
     }
 
     fn ask_rename_path(&mut self, path: PathBuf) {
+        if self.reject_archive(std::slice::from_ref(&path)) { return; }
         if let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) {
             self.dialog = Some(Dialog::Rename { path, text: name, first: true });
         }
     }
 
     fn ask_new_folder(&mut self, parent: PathBuf) {
+        if archive::is_location(&parent) || self.reject_archive(std::slice::from_ref(&parent)) {
+            self.status = "압축 파일 안에서는 할 수 없습니다".into(); return;
+        }
         let mut name = "새 폴더".to_string();
         let mut k = 2;
         while parent.join(&name).exists() {
@@ -1229,6 +1355,9 @@ impl App {
     }
 
     fn do_new_folder(&mut self, parent: PathBuf, name: &str) {
+        if archive::is_location(&parent) || self.reject_archive(std::slice::from_ref(&parent)) {
+            self.status = "압축 파일 안에서는 할 수 없습니다".into(); return;
+        }
         let name = name.trim();
         if name.is_empty() {
             return;
@@ -1258,13 +1387,16 @@ impl App {
     fn refresh_dir(&mut self, d: &Path) {
         self.restore_missing_dirs();
         self.tree_children.retain(|k, _| !k.starts_with(d));
-        for pi in panes_showing(&self.panes, d) {
+        let panes: Vec<_> = self.panes.iter().enumerate().filter_map(|(pi, p)|
+            (p.cur_dir == d || watch_dir(&p.cur_dir) == d).then_some(pi)).collect();
+        for pi in panes {
             self.reload(pi, None);
         }
         self.sync_watch_dirs();
     }
 
     fn do_rename(&mut self, path: PathBuf, new_name: &str) {
+        if self.reject_archive(std::slice::from_ref(&path)) { return; }
         let new_name = new_name.trim();
         if new_name.is_empty() {
             return;
@@ -1311,6 +1443,14 @@ impl App {
     }
 
     fn run(&mut self, a: Action) {
+        let blocked = match &a {
+            Action::Cut(ps) | Action::Copy(ps) | Action::Delete(ps) | Action::PickAndTransfer(ps, _) => ps.iter().any(|p| archive_read_only(p)),
+            Action::Rename(p) | Action::Properties(p) | Action::ShowInExplorer(p) => archive_read_only(p),
+            Action::Paste(p) | Action::NewFolder(p) => archive::is_location(p) || archive_read_only(p),
+            Action::Transfer(ps, d, _) => archive::is_location(d) || archive_read_only(d) || ps.iter().any(|p| archive_read_only(p)),
+            _ => false,
+        };
+        if blocked { self.status = "압축 파일 안에서는 할 수 없습니다".into(); return; }
         match a {
             Action::Open(pi, i) => self.open_entry(pi, i),
             Action::Go(p) => self.navigate(self.active, p, true),
@@ -1392,6 +1532,10 @@ impl App {
 
     /// Make `resp` (a folder) accept dragged files.
     fn drop_target(&mut self, ui: &Ui, resp: &egui::Response, dir: &Path) {
+        if archive::is_location(&self.pane().cur_dir) || archive::is_location(dir) || archive_read_only(dir) {
+            if resp.dnd_hover_payload::<DragFiles>().is_some() { self.status = "압축 파일 안에서는 할 수 없습니다".into(); }
+            return;
+        }
         if let Some(drag) = resp.dnd_hover_payload::<DragFiles>() {
             self.dnd_folder_hover = true;
             let valid = drop_dest(dir, &drag.0).is_some();
@@ -1431,12 +1575,12 @@ impl App {
             egui::DragAndDrop::clear_payload(ctx);
             self.dnd_target = None;
             let n = files.len();
-            match fileops::drag_out(&files) {
+            match fileops::drag_out(self.hwnd, &files) {
                 Ok(0) => {}
                 Ok(_) => self.status = format!("{n}개 항목을 다른 프로그램에 넘겼습니다"),
                 Err(e) => self.status = format!("끌어놓기 실패: {e}"),
             }
-            fileops::post_left_button_up();
+            fileops::post_left_button_up(self.hwnd);
             ctx.request_repaint();
             return;
         }
@@ -1463,6 +1607,9 @@ impl App {
     }
 
     fn paste(&mut self, dest: PathBuf) {
+        if archive::is_location(&dest) || self.reject_archive(std::slice::from_ref(&dest)) {
+            self.status = "압축 파일 안에서는 할 수 없습니다".into(); return;
+        }
         let Some((files, cut)) = fileops::clipboard_get_files() else {
             self.status = "붙여넣을 파일이 없습니다".into();
             return;
@@ -1472,6 +1619,9 @@ impl App {
 
     /// Copy or move `files` into `dest` on a worker thread with Explorer's dialogs.
     fn transfer(&mut self, files: Vec<PathBuf>, dest: PathBuf, cut: bool, from_clipboard: bool) {
+        if archive::is_location(&dest) || self.reject_archive(&files) || self.reject_archive(std::slice::from_ref(&dest)) {
+            self.status = "압축 파일 안에서는 할 수 없습니다".into(); return;
+        }
         if files.is_empty() {
             return;
         }
@@ -1511,9 +1661,86 @@ impl App {
         });
     }
 
+    /// Returns whether to draw the egui fallback.
+    fn native_menu(&mut self, resp: &egui::Response, targets: &[PathBuf], dir: &Path,
+        folder_extras: bool, viewer: Option<(usize, usize)>) -> bool {
+        if archive::is_archive(dir) && dir.is_file() { return true; }
+        use shellmenu::{ExtraItem, Intercept, MenuResult};
+        let key = resp.id.with("shell_fallback");
+        if resp.secondary_clicked() {
+            let mut actions = Vec::new();
+            let mut extra = Vec::new();
+            let mut add = |label: String, action: Action| {
+                let id = actions.len() as u32;
+                actions.push(action);
+                ExtraItem { id, label, enabled: true, submenu: Vec::new() }
+            };
+            if folder_extras {
+                let f = targets.first().cloned().unwrap_or_else(|| dir.to_path_buf());
+                extra.push(if self.favorites.contains(&f) {
+                    add("즐겨찾기에서 제거".into(), Action::RemoveFavorite(f))
+                } else {
+                    add("즐겨찾기에 추가".into(), Action::AddFavorite(f))
+                });
+                extra.push(add("새로고침".into(), Action::Refresh(dir.to_path_buf())));
+            } else {
+                if targets.len() == 1 {
+                    if let Some((pi, i)) = viewer {
+                        extra.push(add("크게보기".into(), Action::Open(pi, i)));
+                    }
+                }
+                for (label, mv) in [("복사할 곳", false), ("이동할 곳", true)] {
+                    let mut submenu = Vec::new();
+                    for dest in self.transfer_dirs.iter().take(TRANSFER_MAX) {
+                        submenu.push(add(dest.display().to_string(), Action::Transfer(targets.to_vec(), dest.clone(), mv)));
+                    }
+                    submenu.push(add("폴더 선택…".into(), Action::PickAndTransfer(targets.to_vec(), mv)));
+                    extra.push(ExtraItem { id: u32::MAX, label: label.into(), enabled: true, submenu });
+                }
+            }
+            let result = (|| {
+                let pos = resp.ctx.input(|i| i.pointer.interact_pos())?;
+                let scale = resp.ctx.pixels_per_point();
+                let hwnd = self.hwnd;
+                if hwnd.0.is_null() { return None; }
+                let mut point = windows::Win32::Foundation::POINT {
+                    x: (pos.x * scale).round() as i32, y: (pos.y * scale).round() as i32,
+                };
+                if !unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point) }.as_bool() { return None; }
+                let screen = (point.x, point.y);
+                let result = if targets.is_empty() {
+                    shellmenu::show_for_folder_background(hwnd, screen, dir, &extra)
+                } else {
+                    shellmenu::show_for_items(hwnd, screen, targets, &extra)
+                };
+                Some((result, shellmenu::failed()))
+            })();
+            let (result, failed) = result.unwrap_or((MenuResult::None, true));
+            resp.ctx.data_mut(|d| d.insert_temp(key, failed));
+            let paste_dir = if targets.len() == 1 && targets[0].is_dir() { targets[0].clone() } else { dir.to_path_buf() };
+            let action = match result {
+                MenuResult::Extra(id) => actions.into_iter().nth(id as usize),
+                MenuResult::Intercepted(Intercept::Rename) => targets.first().cloned().map(Action::Rename),
+                MenuResult::Intercepted(Intercept::Delete) => Some(Action::Delete(targets.to_vec())),
+                MenuResult::Intercepted(Intercept::Cut) => Some(Action::Cut(targets.to_vec())),
+                MenuResult::Intercepted(Intercept::Copy) => Some(Action::Copy(targets.to_vec())),
+                MenuResult::Intercepted(Intercept::Paste) => Some(Action::Paste(paste_dir)),
+                _ => None,
+            };
+            if let Some(action) = action { self.actions.push(action); }
+        }
+        resp.ctx.data(|d| d.get_temp::<bool>(key).unwrap_or(false))
+    }
+
     /// Explorer-style menu. `targets` are the right-clicked items (empty = blank
     /// area); `dir` is the folder that "new folder", "paste" and "refresh" use.
     fn file_menu(&mut self, ui: &mut Ui, targets: Vec<PathBuf>, dir: PathBuf) {
+        if archive::is_archive(&dir) && dir.is_file() {
+            if let Some(path) = targets.first() {
+                if ui.button("경로 복사").clicked() { ui.ctx().copy_text(path.display().to_string()); ui.close_menu(); }
+            } else if ui.button("경로 복사").clicked() { ui.ctx().copy_text(dir.display().to_string()); ui.close_menu(); }
+            return;
+        }
         let one_dir = (targets.len() == 1 && targets[0].is_dir()).then(|| targets[0].clone());
         let fav_target = one_dir.clone().or_else(|| targets.is_empty().then(|| dir.clone()));
         let paste_dir = one_dir.clone().unwrap_or_else(|| dir.clone());
@@ -1621,7 +1848,9 @@ impl App {
             if r.clicked() {
                 *nav = Some(path.to_path_buf());
             }
-            r.context_menu(|ui| self.file_menu(ui, vec![path.to_path_buf()], path.to_path_buf()));
+            if self.native_menu(&r, &[path.to_path_buf()], path, true, None) {
+                r.context_menu(|ui| self.file_menu(ui, vec![path.to_path_buf()], path.to_path_buf()));
+            }
             if selected && self.tree_scroll_pending {
                 r.scroll_to_me(Some(Align::Center));
                 self.tree_scroll_pending = false;
@@ -1699,6 +1928,11 @@ impl App {
                 i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
             )
         });
+        if archive::is_location(&self.pane().cur_dir)
+            && (copy || cut || pressed(Key::Delete) || pressed(Key::F2)) {
+            self.status = "압축 파일 안에서는 할 수 없습니다".into();
+            return;
+        }
         if copy {
             self.actions.push(Action::Copy(self.pane().selected_paths()));
         }
@@ -1766,6 +2000,7 @@ impl App {
     fn toolbar(&mut self, ui: &mut Ui) {
         use icons::tool_button;
         let ic = self.icons.clone();
+        let writable = !archive::is_location(&self.pane().cur_dir);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             if tool_button(ui, &ic.back, "뒤로", !self.panes[self.active].back.is_empty()).on_hover_text("Alt+←").clicked() {
@@ -1811,23 +2046,31 @@ impl App {
             ui.separator();
 
             let has_img = self.panes[self.active].focus.and_then(|i| self.panes[self.active].entries.get(i)).map(|e| e.is_img()).unwrap_or(false);
-            let has_sel = !self.pane().selected_paths().is_empty();
+            let has_sel = writable && !self.pane().selected_paths().is_empty();
             if tool_button(ui, &ic.view, "크게보기", has_img).on_hover_text("Enter").clicked() {
                 if let Some(f) = self.panes[self.active].focus {
                     self.open_entry(self.active, f);
                 }
             }
-            if tool_button(ui, &ic.rotate_left, "-90° 회전", has_sel).on_hover_text("파일에 저장됩니다").clicked() {
+            let left = tool_button(ui, &ic.rotate_left, "-90° 회전", has_sel).on_hover_text("파일에 저장됩니다");
+            if left.clicked() {
                 self.rotate_current(-1);
             }
-            if tool_button(ui, &ic.rotate_right, "90° 회전", has_sel).on_hover_text("파일에 저장됩니다").clicked() {
+            let right = tool_button(ui, &ic.rotate_right, "90° 회전", has_sel).on_hover_text("파일에 저장됩니다");
+            if right.clicked() {
                 self.rotate_current(1);
             }
-            if tool_button(ui, &ic.rename, "이름변경", self.panes[self.active].focus.is_some()).on_hover_text("F2").clicked() {
+            let rename = tool_button(ui, &ic.rename, "이름변경", writable && self.panes[self.active].focus.is_some()).on_hover_text("F2");
+            if rename.clicked() {
                 self.ask_rename();
             }
-            if tool_button(ui, &ic.delete, "삭제", has_sel).on_hover_text("Delete (휴지통으로)").clicked() {
+            let delete = tool_button(ui, &ic.delete, "삭제", has_sel).on_hover_text("Delete (휴지통으로)");
+            if delete.clicked() {
                 self.actions.push(Action::Delete(self.pane().selected_paths()));
+            }
+            if !writable && ui.input(|i| i.pointer.primary_clicked())
+                && [&left, &right, &rename, &delete].iter().any(|r| ui.rect_contains_pointer(r.rect)) {
+                self.status = "압축 파일 안에서는 할 수 없습니다".into();
             }
             if tool_button(ui, &ic.explorer, "탐색기", true).on_hover_text("탐색기에서 열기").clicked() {
                 let p = self.panes[self.active].focus.and_then(|i| self.panes[self.active].entries.get(i)).map(|e| e.path.clone());
@@ -2030,7 +2273,7 @@ impl App {
             let sel_size: u64 = self.panes[self.active].selected.iter().filter_map(|&i| self.panes[self.active].entries.get(i)).map(|e| e.size).sum();
             ui.label(format!("{} 개체 선택 ({})", self.panes[self.active].selected.len(), fmt_size(sel_size)));
             ui.separator();
-            let imgs = self.panes[self.active].entries.iter().filter(|e| e.is_img()).count();
+            let imgs = self.panes[self.active].entries.iter().filter(|e| e.is_img() || (!e.is_dir && archive::is_archive(&e.path))).count();
             let media = self.panes[self.active].entries.iter().filter(|e| e.media.is_some()).count();
             if media > 0 {
                 ui.label(format!("총 {} 개체 (그림 {imgs}, 동영상·음성 {media})", self.panes[self.active].entries.len()));
@@ -2038,7 +2281,7 @@ impl App {
                 ui.label(format!("총 {} 개체 (그림 {imgs})", self.panes[self.active].entries.len()));
             }
             if self.kind_filter != KindFilter::All {
-                let hidden = self.panes[self.active].kind_counts[0] - self.panes[self.active].entries.iter().filter(|e| !e.is_dir).count();
+                let hidden = self.panes[self.active].kind_counts[0].saturating_sub(self.panes[self.active].entries.iter().filter(|e| !e.is_dir).count());
                 ui.separator();
                 ui.colored_label(
                     Color32::from_rgb(40, 120, 220),
@@ -2086,23 +2329,21 @@ impl App {
                 if r.clicked() {
                     self.actions.push(Action::Go(f.clone()));
                 }
-                let ic = self.icons.clone();
-                r.context_menu(|ui| {
-                    icons::style_menu(ui, 200.0);
-                    if icons::menu_item(ui, Some(&ic.folder), "열기", "", true).clicked() {
-                        self.actions.push(Action::Go(f.clone()));
-                        ui.close_menu();
-                    }
-                    if icons::menu_item(ui, Some(&ic.star), "즐겨찾기에서 제거", "", true).clicked() {
-                        self.actions.push(Action::RemoveFavorite(f.clone()));
-                        ui.close_menu();
-                    }
-                });
+                if self.native_menu(&r, &[f.clone()], &f, true, None) {
+                    r.context_menu(|ui| self.file_menu(ui, vec![f.clone()], f.clone()));
+                }
             }
         }
     }
 
     fn grid(&mut self, ui: &mut Ui, pi: usize) {
+        if self.panes[pi].archive_loading {
+            ui.vertical_centered(|ui| { ui.spinner(); ui.label("읽는 중…"); });
+            if self.panes[pi].cur_dir.parent().is_some() && ui.button("..  (상위 폴더)").clicked() {
+                self.activate(pi); self.actions.push(Action::Up);
+            }
+            return;
+        }
         // empty folder: the whole panel is blank area (see `blank_area`)
         let n = self.panes[pi].entries.len();
         let off = self.panes[pi].slot_off();
@@ -2192,7 +2433,9 @@ impl App {
             self.panes[pi].selected.clear();
         }
         let dir = self.panes[pi].cur_dir.clone();
-        bg.context_menu(|ui| self.file_menu(ui, Vec::new(), dir.clone()));
+        if self.native_menu(&bg, &[], &dir, true, None) {
+            bg.context_menu(|ui| self.file_menu(ui, Vec::new(), dir.clone()));
+        }
     }
 
     /// One wheel notch scrolls exactly one row of thumbnails.
@@ -2304,13 +2547,20 @@ impl App {
         if resp.double_clicked() {
             self.actions.push(Action::Up);
         }
-        self.drop_target(ui, &resp, &parent);
+        if !archive::is_location(&self.panes[pi].cur_dir) {
+            self.drop_target(ui, &resp, &parent);
+        } else if resp.dnd_hover_payload::<DragFiles>().is_some() {
+            self.status = "압축 파일 안에서는 할 수 없습니다".into();
+        }
     }
 
     fn cell(&mut self, ui: &mut Ui, pi: usize, i: usize, rect: Rect) {
         let resp = ui.interact(rect, ui.id().with(("cell", i)), Sense::click_and_drag());
         if resp.clicked() || resp.secondary_clicked() || resp.drag_started() { self.activate(pi); }
-        if resp.drag_started() {
+        if resp.drag_started() && archive::is_location(&self.panes[pi].cur_dir) {
+            self.status = "압축 파일 안에서는 할 수 없습니다".into();
+        }
+        if resp.drag_started() && !archive::is_location(&self.panes[pi].cur_dir) {
             if !self.panes[pi].selected.contains(&i) {
                 self.select_single(pi, i);
             }
@@ -2367,7 +2617,7 @@ impl App {
                     draw_image(ui, t, t.size_vec2(), img_area, self.disp_rot(&e.path, t), None, Vec2::ZERO);
                 }
                 Thumb::Failed => {
-                    painter.text(img_area.center(), Align2::CENTER_CENTER, "읽을 수 없음", FontId::proportional(12.0), Color32::GRAY);
+                    painter.text(img_area.center(), Align2::CENTER_CENTER, if archive::is_archive(&e.path) { "그림 없음" } else { "읽을 수 없음" }, FontId::proportional(12.0), Color32::GRAY);
                 }
                 _ => {
                     painter.rect_filled(img_area.shrink(ts * 0.3), 4.0, Color32::from_gray(238));
@@ -2380,6 +2630,11 @@ impl App {
                 painter.rect_filled(badge, 4.0f32, bg);
                 let mark = if m == loader::Media::Video { "▶" } else { "♪" };
                 painter.text(badge.center(), Align2::CENTER_CENTER, mark, FontId::proportional(15.0), Color32::WHITE);
+            }
+            if archive::is_archive(&e.path) {
+                let badge = Rect::from_min_size(img_area.left_bottom() - vec2(0.0, 22.0), vec2(34.0, 20.0));
+                painter.rect_filled(badge, 3.0, Color32::from_black_alpha(170));
+                painter.text(badge.center(), Align2::CENTER_CENTER, archive::badge(&e.path), FontId::proportional(11.0), Color32::WHITE);
             }
         }
 
@@ -2417,40 +2672,50 @@ impl App {
         let targets = if selected { self.panes[pi].selected_paths() } else { vec![path.clone()] };
         let is_folder = self.panes[pi].entries[i].is_dir;
         let ic = self.icons.clone();
-        resp.context_menu(|ui| {
-            icons::style_menu(ui, 240.0);
-            let open = egui::RichText::new(if is_img { "크게보기" } else { "열기" }).strong();
-            let open_icon = if is_img { Some(&ic.view) } else if is_folder { Some(&ic.folder) } else { None };
-            if icons::menu_item(ui, open_icon, open, "Enter", true).clicked() {
-                self.actions.push(Action::Open(pi, i));
-                ui.close_menu();
-            }
-            if is_img {
-                if icons::menu_item(ui, Some(&ic.rotate_right), "시계 방향으로 회전", "R", true).clicked() {
-                    self.actions.push(Action::Rotate(targets.clone(), 1));
+        let dir = self.panes[pi].cur_dir.clone();
+        if archive::is_archive(&dir) && dir.is_file() {
+            resp.context_menu(|ui| {
+                if ui.button("크게보기").clicked() { self.actions.push(Action::Open(pi, i)); ui.close_menu(); }
+                if ui.button("경로 복사").clicked() { ui.ctx().copy_text(path.display().to_string()); ui.close_menu(); }
+            });
+            return;
+        }
+        if self.native_menu(&resp, &targets, &dir, false, is_img.then_some((pi, i))) {
+            resp.context_menu(|ui| {
+                icons::style_menu(ui, 240.0);
+                let open = egui::RichText::new(if is_img { "크게보기" } else { "열기" }).strong();
+                let open_icon = if is_img { Some(&ic.view) } else if is_folder { Some(&ic.folder) } else { None };
+                if icons::menu_item(ui, open_icon, open, "Enter", true).clicked() {
+                    self.actions.push(Action::Open(pi, i));
                     ui.close_menu();
                 }
-                if icons::menu_item(ui, Some(&ic.rotate_left), "시계 반대 방향으로 회전", "L", true).clicked() {
-                    self.actions.push(Action::Rotate(targets.clone(), -1));
+                if is_img {
+                    if icons::menu_item(ui, Some(&ic.rotate_right), "시계 방향으로 회전", "R", true).clicked() {
+                        self.actions.push(Action::Rotate(targets.clone(), 1));
+                        ui.close_menu();
+                    }
+                    if icons::menu_item(ui, Some(&ic.rotate_left), "시계 반대 방향으로 회전", "L", true).clicked() {
+                        self.actions.push(Action::Rotate(targets.clone(), -1));
+                        ui.close_menu();
+                    }
+                }
+                icons::menu_sep(ui);
+                let dir = self.panes[pi].cur_dir.clone();
+                self.file_menu(ui, targets.clone(), dir);
+                icons::menu_sep(ui);
+                ui.menu_button("      복사할 곳", |ui| self.dest_menu(ui, &targets, false));
+                ui.menu_button("      이동할 곳", |ui| self.dest_menu(ui, &targets, true));
+                icons::menu_sep(ui);
+                if icons::menu_item(ui, Some(&ic.explorer), "탐색기에서 보기", "", true).clicked() {
+                    self.actions.push(Action::ShowInExplorer(path.clone()));
                     ui.close_menu();
                 }
-            }
-            icons::menu_sep(ui);
-            let dir = self.panes[pi].cur_dir.clone();
-            self.file_menu(ui, targets.clone(), dir);
-            icons::menu_sep(ui);
-            ui.menu_button("      복사할 곳", |ui| self.dest_menu(ui, &targets, false));
-            ui.menu_button("      이동할 곳", |ui| self.dest_menu(ui, &targets, true));
-            icons::menu_sep(ui);
-            if icons::menu_item(ui, Some(&ic.explorer), "탐색기에서 보기", "", true).clicked() {
-                self.actions.push(Action::ShowInExplorer(path.clone()));
-                ui.close_menu();
-            }
-            if icons::menu_item(ui, None, "경로 복사", "", true).clicked() {
-                ui.ctx().copy_text(path.display().to_string());
-                ui.close_menu();
-            }
-        });
+                if icons::menu_item(ui, None, "경로 복사", "", true).clicked() {
+                    ui.ctx().copy_text(path.display().to_string());
+                    ui.close_menu();
+                }
+            });
+        }
     }
 
     fn preview(&mut self, ui: &mut Ui) {
@@ -2573,7 +2838,10 @@ impl App {
             });
         });
         let mut dropping = false;
-        if over && !self.dnd_folder_hover {
+        if over && archive::is_location(&self.panes[pi].cur_dir) && drag.is_some() {
+            self.status = "압축 파일 안에서는 할 수 없습니다".into();
+        }
+        if over && !self.dnd_folder_hover && !archive::is_location(&self.panes[pi].cur_dir) {
             if let Some(drag) = drag {
                 if let Some(dest) = drop_dest(&self.panes[pi].cur_dir, &drag.0) {
                     dropping = true;
@@ -3438,7 +3706,7 @@ fn list_dir(dir: &Path) -> std::io::Result<Vec<Entry>> {
         let path = de.path();
         let is_dir = md.is_dir();
         let media = if is_dir { None } else { loader::media_kind(&path) };
-        if !is_dir && media.is_none() && !loader::is_image(&path) {
+        if !is_dir && media.is_none() && !loader::is_image(&path) && !archive::is_archive(&path) {
             continue;
         }
         v.push(Entry {
