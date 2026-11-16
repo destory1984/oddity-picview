@@ -384,6 +384,7 @@ mod tests {
             rot: HashMap::new(),
             viewer: None,
             fullscreen: false,
+            viewer_last_motion: None,
             dialog: None,
             status: String::new(),
             drives,

@@ -44,6 +44,44 @@ const CLIP_HOVER: Duration = Duration::from_millis(300);
 /// Video previews kept in memory (10 textures each).
 const CLIP_CACHE: usize = 24;
 
+fn overlay_alpha(idle: Duration) -> f32 {
+    if idle < Duration::from_millis(1500) {
+        1.0
+    } else {
+        (1.0 - idle.saturating_sub(Duration::from_millis(1500)).as_secs_f32() / 0.3).max(0.0)
+    }
+}
+
+fn hide_cursor(fullscreen: bool, idle: Duration) -> bool {
+    fullscreen && idle >= Duration::from_secs(2)
+}
+
+#[cfg(test)]
+mod fullscreen_tests {
+    use super::{hide_cursor, overlay_alpha};
+    use std::time::Duration;
+
+    #[test]
+    fn overlay_visible_while_moving() {
+        assert_eq!(overlay_alpha(Duration::ZERO), 1.0);
+        assert_eq!(overlay_alpha(Duration::from_millis(1499)), 1.0);
+    }
+
+    #[test]
+    fn overlay_fades_out() {
+        assert!((0.4..=0.6).contains(&overlay_alpha(Duration::from_millis(1650))));
+        assert_eq!(overlay_alpha(Duration::from_millis(1800)), 0.0);
+        assert_eq!(overlay_alpha(Duration::from_secs(5)), 0.0);
+    }
+
+    #[test]
+    fn cursor_hidden_only_in_fullscreen_after_2s() {
+        assert!(!hide_cursor(true, Duration::from_millis(1999)));
+        assert!(hide_cursor(true, Duration::from_secs(2)));
+        assert!(!hide_cursor(false, Duration::from_secs(10)));
+    }
+}
+
 // ---------------------------------------------------------------- data types
 
 /// Which kinds of files the list shows. Folders always stay.
@@ -238,6 +276,7 @@ struct App {
 
     viewer: Option<Viewer>,
     fullscreen: bool,
+    viewer_last_motion: Option<Instant>,
     dialog: Option<Dialog>,
     status: String,
 
@@ -393,6 +432,7 @@ impl App {
             rot: HashMap::new(),
             viewer: None,
             fullscreen: false,
+            viewer_last_motion: None,
             dialog: None,
             status: String::new(),
             drives,
@@ -784,7 +824,19 @@ impl App {
             fileops::open_default(&e.path);
         } else {
             self.viewer = Some(Viewer { pane: pi, idx: i, zoom: None, pan: Vec2::ZERO });
+            self.viewer_last_motion = None;
         }
+    }
+
+    fn open_selected_fullscreen(&mut self) {
+        let Some(i) = self.pane().focus.filter(|&i| {
+            self.pane().entries.get(i).is_some_and(|e| e.is_img())
+        }) else { return };
+        self.open_entry(self.active, i);
+        if self.viewer.is_some() && !self.fullscreen {
+            self.toggle_fullscreen();
+        }
+        self.ctx.request_repaint();
     }
 
     fn sort_entries(&mut self, pi: usize) {
@@ -1890,6 +1942,10 @@ impl App {
             )
         });
         let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
+        if pressed(Key::F11) {
+            self.open_selected_fullscreen();
+            return;
+        }
         if ctx.input_mut(|i| i.consume_key(mods, Key::Tab)) {
             let n = self.panes.len();
             self.activate((self.active + if mods.shift { n - 1 } else { 1 }) % n);
@@ -2051,6 +2107,9 @@ impl App {
                 if let Some(f) = self.panes[self.active].focus {
                     self.open_entry(self.active, f);
                 }
+            }
+            if icons::fullscreen_tool_button(ui, has_img).on_hover_text("전체 화면으로 보기 (F11)").clicked() {
+                self.open_selected_fullscreen();
             }
             let left = tool_button(ui, &ic.rotate_left, "-90° 회전", has_sel).on_hover_text("파일에 저장됩니다");
             if left.clicked() {
@@ -2920,8 +2979,12 @@ impl App {
     }
 
     fn close_viewer(&mut self) {
+        self.viewer_last_motion = None;
+        self.ctx.set_cursor_icon(egui::CursorIcon::Default);
         if let Some(v) = self.viewer.take() {
-            self.select_single(v.pane, v.idx);
+            if self.panes.get(v.pane).is_some_and(|p| v.idx < p.entries.len()) {
+                self.select_single(v.pane, v.idx);
+            }
         }
         if self.fullscreen {
             self.toggle_fullscreen();
@@ -2931,7 +2994,7 @@ impl App {
     fn viewer_ui(&mut self, ctx: &egui::Context) {
         let Some((pi, idx)) = self.viewer.as_ref().map(|v| (v.pane, v.idx)) else { return };
         if pi >= self.panes.len() || idx >= self.panes[pi].entries.len() {
-            self.viewer = None;
+            self.close_viewer();
             return;
         }
 
@@ -3002,8 +3065,24 @@ impl App {
         let pos = self.panes[pi].entries[..=idx].iter().filter(|e| e.is_img()).count();
         let name = self.panes[pi].entries[idx].name.clone();
 
+        let now = Instant::now();
+        let last_motion = self.viewer_last_motion.get_or_insert(now);
+        if ctx.input(|i| i.pointer.delta() != Vec2::ZERO) {
+            *last_motion = now;
+        }
+        let idle = now.saturating_duration_since(*last_motion);
+        let alpha = overlay_alpha(idle);
+        if idle < Duration::from_millis(1500) {
+            ctx.request_repaint_after(Duration::from_millis(1500) - idle);
+        } else if alpha > 0.0 {
+            ctx.request_repaint_after(Duration::from_millis(16).min(Duration::from_millis(1800) - idle));
+        }
+        if self.fullscreen && idle < Duration::from_secs(2) {
+            ctx.request_repaint_after(Duration::from_secs(2) - idle);
+        }
+
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(Color32::from_gray(18)))
+            .frame(egui::Frame::default().fill(if self.fullscreen { Color32::BLACK } else { Color32::from_gray(18) }))
             .show(ctx, |ui| {
                 let area = ui.max_rect();
                 let resp = ui.interact(area, Id::new("viewer_area"), Sense::click_and_drag());
@@ -3061,11 +3140,11 @@ impl App {
                         info = format!("{name}   ({pos}/{total})   불러오는 중…");
                     }
                 }
-                if !info.is_empty() {
+                if !info.is_empty() && alpha > 0.0 {
                     let p = ui.painter();
                     let r = p.text(area.min + vec2(12.0, 10.0), Align2::LEFT_TOP, &info, FontId::proportional(14.0), Color32::TRANSPARENT);
-                    p.rect_filled(r.expand(6.0), 4.0, Color32::from_black_alpha(150));
-                    p.text(area.min + vec2(12.0, 10.0), Align2::LEFT_TOP, &info, FontId::proportional(14.0), Color32::WHITE);
+                    p.rect_filled(r.expand(6.0), 4.0, Color32::from_black_alpha((150.0 * alpha) as u8));
+                    p.text(area.min + vec2(12.0, 10.0), Align2::LEFT_TOP, &info, FontId::proportional(14.0), Color32::from_white_alpha((255.0 * alpha) as u8));
                 }
                 if resp.double_clicked() {
                     self.close_viewer();
@@ -3078,6 +3157,25 @@ impl App {
                     }
                 }
             });
+        if self.viewer.is_some() && alpha > 0.0 {
+            egui::Area::new(Id::new("viewer_fullscreen_button"))
+                .order(egui::Order::Foreground)
+                .anchor(Align2::RIGHT_TOP, vec2(-12.0, 12.0))
+                .movable(false)
+                .show(ctx, |ui| {
+                    let (rect, response) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
+                    ui.painter().rect_filled(rect, 6.0, Color32::from_black_alpha((170.0 * alpha) as u8));
+                    icons::fullscreen_icon(ui.painter(), Rect::from_center_size(rect.center(), vec2(20.0, 20.0)),
+                        self.fullscreen, Color32::from_white_alpha((255.0 * alpha) as u8));
+                    let hint = if self.fullscreen { "창으로 보기 (F11, Esc)" } else { "전체 화면 (F11)" };
+                    if response.on_hover_text(hint).clicked() && !self.modal_open() {
+                        self.toggle_fullscreen();
+                    }
+                });
+        }
+        if self.viewer.is_some() && hide_cursor(self.fullscreen, idle) && !self.modal_open() {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
     }
 
     // ------------------------------------------------------------ settings
@@ -3557,6 +3655,16 @@ impl eframe::App for App {
         }
         self.poll_msgs();
         self.refresh_changed_dirs();
+        // Open the first listed image once for capture checks.
+        static FULLSCREEN_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("PICVIEW_OPEN_FULLSCREEN").is_ok_and(|v| v == "1")
+            && !FULLSCREEN_OPENED.load(Ordering::Relaxed) {
+            if let Some(i) = self.pane().entries.iter().position(|e| e.is_img()) {
+                FULLSCREEN_OPENED.store(true, Ordering::Relaxed);
+                self.select_single(self.active, i);
+                self.open_selected_fullscreen();
+            }
+        }
         // Ctrl+V: egui only reports it when the clipboard holds text
         let v = ctx.input(|i| i.focused) && fileops::ctrl_v_down();
         if v && !self.ctrl_v_prev && self.viewer.is_none() && !self.modal_open() && !ctx.wants_keyboard_input() {

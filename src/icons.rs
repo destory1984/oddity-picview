@@ -68,6 +68,34 @@ pub const H: f32 = 40.0;
 /// Toolbar button: icon on top, label below. Hover lights it up, pressing pushes
 /// the icon down a little so the click is felt; disabled ones are greyed out.
 pub fn tool_button(ui: &mut Ui, icon: &TextureHandle, label: &str, enabled: bool) -> Response {
+    toolbar_button(ui, label, enabled, |p, rect| {
+        let tint = if enabled { Color32::WHITE } else { Color32::from_white_alpha(70) };
+        p.image(icon.id(), rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
+    })
+}
+
+pub fn fullscreen_tool_button(ui: &mut Ui, enabled: bool) -> Response {
+    toolbar_button(ui, "전체 화면", enabled, |p, rect| {
+        let color = if enabled { Color32::from_gray(55) } else { Color32::from_gray(160) };
+        fullscreen_icon(p, rect, false, color);
+    })
+}
+
+/// Four corners, pointing inward when restoring the window.
+pub fn fullscreen_icon(p: &egui::Painter, rect: Rect, inward: bool, color: Color32) {
+    let center = rect.center();
+    for x in [-1.0, 1.0] {
+        for y in [-1.0, 1.0] {
+            let outer = center + vec2(x, y) * 8.0;
+            let corner = if inward { center + vec2(x, y) * 3.0 } else { outer };
+            let direction = if inward { 1.0 } else { -1.0 };
+            p.line_segment([corner, corner + vec2(x * direction * 5.0, 0.0)], egui::Stroke::new(2.0f32, color));
+            p.line_segment([corner, corner + vec2(0.0, y * direction * 5.0)], egui::Stroke::new(2.0f32, color));
+        }
+    }
+}
+
+fn toolbar_button(ui: &mut Ui, label: &str, enabled: bool, paint: impl FnOnce(&egui::Painter, Rect)) -> Response {
     let font = FontId::proportional(11.5);
     let text_w = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font.clone(), Color32::BLACK).size().x);
     let w = (text_w + 6.0).max(34.0);
@@ -89,8 +117,7 @@ pub fn tool_button(ui: &mut Ui, icon: &TextureHandle, label: &str, enabled: bool
     }
     let push = if pressed { 1.5 } else { 0.0 };
     let icon_rect = Rect::from_center_size(rect.center_top() + vec2(0.0, 4.0 + ICON / 2.0 + push), vec2(ICON, ICON));
-    let tint = if enabled { Color32::WHITE } else { Color32::from_white_alpha(70) };
-    p.image(icon.id(), icon_rect, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
+    paint(p, icon_rect);
     let color = if enabled { Color32::from_gray(25) } else { Color32::from_gray(160) };
     p.text(rect.center_bottom() - vec2(0.0, 8.0 - push), Align2::CENTER_CENTER, label, font, color);
     resp
