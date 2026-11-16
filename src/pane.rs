@@ -385,6 +385,7 @@ mod tests {
             viewer: None,
             fullscreen: false,
             viewer_last_motion: None,
+            viewer_menu_pending: None,
             dialog: None,
             status: String::new(),
             drives,

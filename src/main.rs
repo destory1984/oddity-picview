@@ -56,10 +56,20 @@ fn hide_cursor(fullscreen: bool, idle: Duration) -> bool {
     fullscreen && idle >= Duration::from_secs(2)
 }
 
+fn fullscreen_menu_label(fullscreen: bool) -> &'static str {
+    if fullscreen { "창으로 보기" } else { "전체 화면으로 보기" }
+}
+
 #[cfg(test)]
 mod fullscreen_tests {
-    use super::{hide_cursor, overlay_alpha};
+    use super::{fullscreen_menu_label, hide_cursor, overlay_alpha};
     use std::time::Duration;
+
+    #[test]
+    fn fullscreen_label_follows_state() {
+        assert_eq!(fullscreen_menu_label(false), "전체 화면으로 보기");
+        assert_eq!(fullscreen_menu_label(true), "창으로 보기");
+    }
 
     #[test]
     fn overlay_visible_while_moving() {
@@ -141,6 +151,8 @@ enum Msg {
 /// because most of them change `entries` or the folder tree.
 enum Action {
     Open(usize, usize),
+    ToggleFullscreen,
+    CloseViewer,
     NewFolder(PathBuf),
     AddFavorite(PathBuf),
     RemoveFavorite(PathBuf),
@@ -277,6 +289,7 @@ struct App {
     viewer: Option<Viewer>,
     fullscreen: bool,
     viewer_last_motion: Option<Instant>,
+    viewer_menu_pending: Option<egui::Pos2>,
     dialog: Option<Dialog>,
     status: String,
 
@@ -433,6 +446,7 @@ impl App {
             viewer: None,
             fullscreen: false,
             viewer_last_motion: None,
+            viewer_menu_pending: None,
             dialog: None,
             status: String::new(),
             drives,
@@ -696,7 +710,7 @@ impl App {
         if self.viewer.as_ref().is_some_and(|v| v.pane == pi) {
             match viewed.and_then(|p| self.panes[pi].index_of(&p)) {
                 Some(i) => self.viewer.as_mut().unwrap().idx = i,
-                None => self.viewer = None,
+                None => self.resume_viewer(pi, self.viewer.as_ref().unwrap().idx),
             }
         }
         self.tree_children.remove(&self.panes[pi].cur_dir);
@@ -1366,17 +1380,7 @@ impl App {
             }
         }
         if let Some((pi, idx)) = viewer {
-            let n = self.panes[pi].entries.len();
-            let next = (idx.min(n.saturating_sub(1))..n)
-                .chain((0..idx.min(n)).rev())
-                .find(|&i| self.panes[pi].entries[i].is_img());
-            match next {
-                Some(i) => {
-                    self.viewer = Some(Viewer { pane: pi, idx: i, zoom: None, pan: Vec2::ZERO });
-                    self.select_single(pi, i);
-                }
-                None => self.viewer = None,
-            }
+            self.resume_viewer(pi, idx);
         }
     }
 
@@ -1505,6 +1509,8 @@ impl App {
         if blocked { self.status = "압축 파일 안에서는 할 수 없습니다".into(); return; }
         match a {
             Action::Open(pi, i) => self.open_entry(pi, i),
+            Action::ToggleFullscreen => self.toggle_fullscreen(),
+            Action::CloseViewer => self.close_viewer(),
             Action::Go(p) => self.navigate(self.active, p, true),
             Action::Up => self.go_up(),
             Action::NewFolder(parent) => self.ask_new_folder(parent),
@@ -1717,71 +1723,81 @@ impl App {
     fn native_menu(&mut self, resp: &egui::Response, targets: &[PathBuf], dir: &Path,
         folder_extras: bool, viewer: Option<(usize, usize)>) -> bool {
         if archive::is_archive(dir) && dir.is_file() { return true; }
-        use shellmenu::{ExtraItem, Intercept, MenuResult};
         let key = resp.id.with("shell_fallback");
         if resp.secondary_clicked() {
-            let mut actions = Vec::new();
-            let mut extra = Vec::new();
-            let mut add = |label: String, action: Action| {
-                let id = actions.len() as u32;
-                actions.push(action);
-                ExtraItem { id, label, enabled: true, submenu: Vec::new() }
-            };
-            if folder_extras {
-                let f = targets.first().cloned().unwrap_or_else(|| dir.to_path_buf());
-                extra.push(if self.favorites.contains(&f) {
-                    add("즐겨찾기에서 제거".into(), Action::RemoveFavorite(f))
-                } else {
-                    add("즐겨찾기에 추가".into(), Action::AddFavorite(f))
-                });
-                extra.push(add("새로고침".into(), Action::Refresh(dir.to_path_buf())));
-            } else {
-                if targets.len() == 1 {
-                    if let Some((pi, i)) = viewer {
-                        extra.push(add("크게보기".into(), Action::Open(pi, i)));
-                    }
-                }
-                for (label, mv) in [("복사할 곳", false), ("이동할 곳", true)] {
-                    let mut submenu = Vec::new();
-                    for dest in self.transfer_dirs.iter().take(TRANSFER_MAX) {
-                        submenu.push(add(dest.display().to_string(), Action::Transfer(targets.to_vec(), dest.clone(), mv)));
-                    }
-                    submenu.push(add("폴더 선택…".into(), Action::PickAndTransfer(targets.to_vec(), mv)));
-                    extra.push(ExtraItem { id: u32::MAX, label: label.into(), enabled: true, submenu });
-                }
-            }
-            let result = (|| {
-                let pos = resp.ctx.input(|i| i.pointer.interact_pos())?;
-                let scale = resp.ctx.pixels_per_point();
-                let hwnd = self.hwnd;
-                if hwnd.0.is_null() { return None; }
-                let mut point = windows::Win32::Foundation::POINT {
-                    x: (pos.x * scale).round() as i32, y: (pos.y * scale).round() as i32,
-                };
-                if !unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point) }.as_bool() { return None; }
-                let screen = (point.x, point.y);
-                let result = if targets.is_empty() {
-                    shellmenu::show_for_folder_background(hwnd, screen, dir, &extra)
-                } else {
-                    shellmenu::show_for_items(hwnd, screen, targets, &extra)
-                };
-                Some((result, shellmenu::failed()))
-            })();
-            let (result, failed) = result.unwrap_or((MenuResult::None, true));
+            let failed = self.show_native_menu(targets, dir, folder_extras, viewer,
+                resp.ctx.input(|i| i.pointer.interact_pos()));
             resp.ctx.data_mut(|d| d.insert_temp(key, failed));
-            let paste_dir = if targets.len() == 1 && targets[0].is_dir() { targets[0].clone() } else { dir.to_path_buf() };
-            let action = match result {
-                MenuResult::Extra(id) => actions.into_iter().nth(id as usize),
-                MenuResult::Intercepted(Intercept::Rename) => targets.first().cloned().map(Action::Rename),
-                MenuResult::Intercepted(Intercept::Delete) => Some(Action::Delete(targets.to_vec())),
-                MenuResult::Intercepted(Intercept::Cut) => Some(Action::Cut(targets.to_vec())),
-                MenuResult::Intercepted(Intercept::Copy) => Some(Action::Copy(targets.to_vec())),
-                MenuResult::Intercepted(Intercept::Paste) => Some(Action::Paste(paste_dir)),
-                _ => None,
-            };
-            if let Some(action) = action { self.actions.push(action); }
         }
         resp.ctx.data(|d| d.get_temp::<bool>(key).unwrap_or(false))
+    }
+
+    fn show_native_menu(&mut self, targets: &[PathBuf], dir: &Path,
+        folder_extras: bool, viewer: Option<(usize, usize)>, pos: Option<egui::Pos2>) -> bool {
+        use shellmenu::{ExtraItem, Intercept, MenuResult};
+        let mut actions = Vec::new();
+        let mut extra = Vec::new();
+        let mut add = |label: String, action: Action| {
+            let id = actions.len() as u32;
+            actions.push(action);
+            ExtraItem { id, label, enabled: true, submenu: Vec::new() }
+        };
+        if folder_extras {
+            let f = targets.first().cloned().unwrap_or_else(|| dir.to_path_buf());
+            extra.push(if self.favorites.contains(&f) {
+                add("즐겨찾기에서 제거".into(), Action::RemoveFavorite(f))
+            } else {
+                add("즐겨찾기에 추가".into(), Action::AddFavorite(f))
+            });
+            extra.push(add("새로고침".into(), Action::Refresh(dir.to_path_buf())));
+        } else {
+            if self.viewer.is_some() {
+                extra.push(add(format!("{}\tF11", fullscreen_menu_label(self.fullscreen)), Action::ToggleFullscreen));
+                extra.push(add("목록으로 돌아가기\tEsc".into(), Action::CloseViewer));
+            } else if targets.len() == 1 {
+                if let Some((pi, i)) = viewer {
+                    extra.push(add("크게보기".into(), Action::Open(pi, i)));
+                }
+            }
+            for (label, mv) in [("복사할 곳", false), ("이동할 곳", true)] {
+                let mut submenu = Vec::new();
+                for dest in self.transfer_dirs.iter().take(TRANSFER_MAX) {
+                    submenu.push(add(dest.display().to_string(), Action::Transfer(targets.to_vec(), dest.clone(), mv)));
+                }
+                submenu.push(add("폴더 선택…".into(), Action::PickAndTransfer(targets.to_vec(), mv)));
+                extra.push(ExtraItem { id: u32::MAX, label: label.into(), enabled: true, submenu });
+            }
+        }
+        let result = (|| {
+            let pos = pos?;
+            let scale = self.ctx.pixels_per_point();
+            let hwnd = self.hwnd;
+            if hwnd.0.is_null() { return None; }
+            let mut point = windows::Win32::Foundation::POINT {
+                x: (pos.x * scale).round() as i32, y: (pos.y * scale).round() as i32,
+            };
+            if !unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point) }.as_bool() { return None; }
+            let screen = (point.x, point.y);
+            let result = if targets.is_empty() {
+                shellmenu::show_for_folder_background(hwnd, screen, dir, &extra)
+            } else {
+                shellmenu::show_for_items(hwnd, screen, targets, &extra)
+            };
+            Some((result, shellmenu::failed()))
+        })();
+        let (result, failed) = result.unwrap_or((MenuResult::None, true));
+        let paste_dir = if targets.len() == 1 && targets[0].is_dir() { targets[0].clone() } else { dir.to_path_buf() };
+        let action = match result {
+            MenuResult::Extra(id) => actions.into_iter().nth(id as usize),
+            MenuResult::Intercepted(Intercept::Rename) => targets.first().cloned().map(Action::Rename),
+            MenuResult::Intercepted(Intercept::Delete) => Some(Action::Delete(targets.to_vec())),
+            MenuResult::Intercepted(Intercept::Cut) => Some(Action::Cut(targets.to_vec())),
+            MenuResult::Intercepted(Intercept::Copy) => Some(Action::Copy(targets.to_vec())),
+            MenuResult::Intercepted(Intercept::Paste) => Some(Action::Paste(paste_dir)),
+            _ => None,
+        };
+        if let Some(action) = action { self.actions.push(action); }
+        failed
     }
 
     /// Explorer-style menu. `targets` are the right-clicked items (empty = blank
@@ -2966,6 +2982,20 @@ impl App {
 
     // ------------------------------------------------------------ UI: viewer
 
+    fn resume_viewer(&mut self, pi: usize, idx: usize) {
+        let n = self.panes[pi].entries.len();
+        let next = (idx.min(n.saturating_sub(1))..n)
+            .chain((0..idx.min(n)).rev())
+            .find(|&i| self.panes[pi].entries[i].is_img());
+        match next {
+            Some(i) => {
+                self.viewer = Some(Viewer { pane: pi, idx: i, zoom: None, pan: Vec2::ZERO });
+                self.select_single(pi, i);
+            }
+            None => self.close_viewer(),
+        }
+    }
+
     fn neighbor_image(&self, pi: usize, from: usize, dir: isize) -> Option<usize> {
         let n = self.panes[pi].entries.len() as isize;
         let mut i = from as isize + dir;
@@ -2979,6 +3009,10 @@ impl App {
     }
 
     fn close_viewer(&mut self) {
+        self.viewer_menu_pending = None;
+        self.ctx.memory_mut(|m| {
+            if m.is_popup_open(Id::new("viewer_menu")) { m.close_popup(); }
+        });
         self.viewer_last_motion = None;
         self.ctx.set_cursor_icon(egui::CursorIcon::Default);
         if let Some(v) = self.viewer.take() {
@@ -2998,8 +3032,11 @@ impl App {
             return;
         }
 
+        let menu_id = Id::new("viewer_menu");
+        let menu_was_open = ctx.memory(|m| m.is_popup_open(menu_id));
+        let open_menu_at = self.viewer_menu_pending.take();
         // keys
-        if !self.modal_open() {
+        if !self.modal_open() && !menu_was_open && open_menu_at.is_none() {
             let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
             let mods = ctx.input(|i| i.modifiers);
             let mut go: Option<usize> = None;
@@ -3065,9 +3102,15 @@ impl App {
         let pos = self.panes[pi].entries[..=idx].iter().filter(|e| e.is_img()).count();
         let name = self.panes[pi].entries[idx].name.clone();
 
+        // Open once after the image has loaded for capture checks.
+        static MENU_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let capture_menu = std::env::var("PICVIEW_VIEWER_MENU").is_ok_and(|v| v == "1")
+            && matches!(self.big.get(&cur), Some(Big::Ready(..) | Big::Failed))
+            && !MENU_SHOWN.swap(true, Ordering::Relaxed);
         let now = Instant::now();
         let last_motion = self.viewer_last_motion.get_or_insert(now);
-        if ctx.input(|i| i.pointer.delta() != Vec2::ZERO) {
+        if menu_was_open || open_menu_at.is_some() || capture_menu
+            || ctx.input(|i| i.pointer.delta() != Vec2::ZERO || i.pointer.secondary_clicked()) {
             *last_motion = now;
         }
         let idle = now.saturating_duration_since(*last_motion);
@@ -3086,8 +3129,20 @@ impl App {
             .show(ctx, |ui| {
                 let area = ui.max_rect();
                 let resp = ui.interact(area, Id::new("viewer_area"), Sense::click_and_drag());
+                if resp.secondary_clicked() && !self.modal_open() {
+                    self.viewer_menu_pending = resp.interact_pointer_pos();
+                    ctx.request_repaint();
+                }
+                if capture_menu {
+                    self.viewer_menu_pending = Some(area.center());
+                    ctx.request_repaint();
+                }
                 let (zoom_delta, scroll_y, hover) =
                     ctx.input(|i| (i.zoom_delta(), i.raw_scroll_delta.y, i.pointer.hover_pos()));
+                let can_interact = !self.modal_open() && !menu_was_open
+                    && open_menu_at.is_none() && self.viewer_menu_pending.is_none();
+                let zoom_delta = if can_interact { zoom_delta } else { 1.0 };
+                let scroll_y = if can_interact { scroll_y } else { 0.0 };
                 let mut info = String::new();
                 let mut nav: Option<isize> = None;
 
@@ -3112,11 +3167,11 @@ impl App {
                             nav = Some(if scroll_y < 0.0 { 1 } else { -1 });
                         }
                         let kz = ctx.input(|i| (i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals), i.key_pressed(Key::Minus)));
-                        if kz.0 || kz.1 {
+                        if can_interact && (kz.0 || kz.1) {
                             scale = (scale * if kz.0 { 1.25 } else { 0.8 }).clamp(0.02, 40.0);
                             v.zoom = Some(scale);
                         }
-                        if resp.dragged() {
+                        if can_interact && resp.dragged_by(egui::PointerButton::Primary) {
                             v.pan += resp.drag_delta();
                         }
                         let pan = v.pan;
@@ -3146,7 +3201,7 @@ impl App {
                     p.rect_filled(r.expand(6.0), 4.0, Color32::from_black_alpha((150.0 * alpha) as u8));
                     p.text(area.min + vec2(12.0, 10.0), Align2::LEFT_TOP, &info, FontId::proportional(14.0), Color32::from_white_alpha((255.0 * alpha) as u8));
                 }
-                if resp.double_clicked() {
+                if can_interact && resp.double_clicked() {
                     self.close_viewer();
                     return;
                 }
@@ -3156,6 +3211,36 @@ impl App {
                         self.select_single(pi, g);
                     }
                 }
+                if let Some(pos) = open_menu_at {
+                    let fallback = archive_read_only(&cur)
+                        || self.show_native_menu(std::slice::from_ref(&cur),
+                            &self.panes[pi].cur_dir.clone(), false, None, Some(pos));
+                    self.viewer_last_motion = Some(Instant::now());
+                    ctx.set_cursor_icon(egui::CursorIcon::Default);
+                    ctx.request_repaint();
+                    if fallback {
+                        ctx.data_mut(|d| d.insert_temp(menu_id.with("position"), pos));
+                        ctx.memory_mut(|m| m.open_popup(menu_id));
+                    }
+                }
+                let mut anchor = resp.clone();
+                let pos = ctx.data(|d| d.get_temp::<egui::Pos2>(menu_id.with("position")))
+                    .unwrap_or(area.center());
+                anchor.rect = Rect::from_min_size(pos, Vec2::ZERO);
+                let mut action = None;
+                egui::popup_below_widget(ui, menu_id, &anchor, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                    icons::style_menu(ui, 240.0);
+                    if icons::menu_item(ui, None, format!("{} (F11)", fullscreen_menu_label(self.fullscreen)), "", true).clicked() {
+                        action = Some(Action::ToggleFullscreen);
+                    }
+                    if icons::menu_item(ui, None, "경로 복사", "", true).clicked() {
+                        ctx.copy_text(cur.display().to_string());
+                    }
+                    if icons::menu_item(ui, None, "목록으로 돌아가기 (Esc)", "", true).clicked() {
+                        action = Some(Action::CloseViewer);
+                    }
+                });
+                if let Some(action) = action { self.actions.push(action); }
             });
         if self.viewer.is_some() && alpha > 0.0 {
             egui::Area::new(Id::new("viewer_fullscreen_button"))
@@ -3173,8 +3258,12 @@ impl App {
                     }
                 });
         }
-        if self.viewer.is_some() && hide_cursor(self.fullscreen, idle) && !self.modal_open() {
+        let idle = self.viewer_last_motion.map(|t| t.elapsed()).unwrap_or_default();
+        if self.viewer.is_some() && hide_cursor(self.fullscreen, idle) && !self.modal_open()
+            && !ctx.memory(|m| m.is_popup_open(menu_id)) && self.viewer_menu_pending.is_none() {
             ctx.set_cursor_icon(egui::CursorIcon::None);
+        } else {
+            ctx.set_cursor_icon(egui::CursorIcon::Default);
         }
     }
 
@@ -3655,6 +3744,16 @@ impl eframe::App for App {
         }
         self.poll_msgs();
         self.refresh_changed_dirs();
+        // Open the first image once for the viewer menu capture switch.
+        static VIEWER_MENU_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("PICVIEW_VIEWER_MENU").is_ok_and(|v| v == "1")
+            && !VIEWER_MENU_OPENED.load(Ordering::Relaxed) {
+            if let Some(i) = self.pane().entries.iter().position(|e| e.is_img()) {
+                VIEWER_MENU_OPENED.store(true, Ordering::Relaxed);
+                self.select_single(self.active, i);
+                self.open_entry(self.active, i);
+            }
+        }
         // Open the first listed image once for capture checks.
         static FULLSCREEN_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if std::env::var("PICVIEW_OPEN_FULLSCREEN").is_ok_and(|v| v == "1")
