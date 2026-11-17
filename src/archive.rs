@@ -145,6 +145,89 @@ pub fn read_entry(archive: &Path, name: &str) -> Result<Vec<u8>, String> {
     })
 }
 
+fn extraction_root() -> PathBuf {
+    std::env::temp_dir().join(crate::APP_ID).join("from-archive")
+}
+
+pub fn extract(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    extract_into(paths, &extraction_root(), None)
+}
+
+pub fn extract_for_drag(paths: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    const MAX_BYTES: u64 = 1024 * 1024 * 1024;
+    if paths.len() > 500 { return Err("끌어놓기는 500개까지 됩니다".into()); }
+    let mut catalogs = std::collections::HashMap::new();
+    let mut total = 0u64;
+    for path in paths {
+        let size = if let Some((archive, name)) = split(path) {
+            if !catalogs.contains_key(&archive) { catalogs.insert(archive.clone(), list_images(&archive)?); }
+            catalogs[&archive].iter().find(|e| e.name == name)
+                .ok_or_else(|| "압축 파일 안의 그림을 찾을 수 없습니다".to_string())?.size
+        } else { std::fs::metadata(path).map_err(error)?.len() };
+        total = total.checked_add(size).ok_or("끌어놓기는 1 GiB까지 됩니다")?;
+        if total > MAX_BYTES { return Err("끌어놓기는 1 GiB까지 됩니다".into()); }
+    }
+    extract_into(paths, &extraction_root(), Some(MAX_BYTES))
+}
+
+fn extract_into(paths: &[PathBuf], root: &Path, limit: Option<u64>) -> Result<Vec<PathBuf>, String> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::create_dir_all(root).map_err(|_| "임시 폴더를 만들 수 없습니다".to_string())?;
+    let folder = loop {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let folder = root.join(format!("{}-{id}", std::process::id()));
+        match std::fs::create_dir(&folder) {
+            Ok(()) => break folder,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("임시 폴더를 만들 수 없습니다".into()),
+        }
+    };
+    let result = (|| {
+        let mut out = Vec::with_capacity(paths.len());
+        let mut used = std::collections::HashSet::new();
+        let mut total = 0u64;
+        for path in paths {
+            let Some((archive, name)) = split(path) else { out.push(path.clone()); continue; };
+            let bytes = read_entry(&archive, &name)?;
+            total = total.checked_add(bytes.len() as u64).ok_or("그림 크기가 너무 큽니다")?;
+            if limit.is_some_and(|max| total > max) { return Err("끌어놓기는 1 GiB까지 됩니다".into()); }
+            let leaf = Path::new(&name).file_name().ok_or("잘못된 그림 이름입니다")?;
+            let leaf = Path::new(leaf);
+            let stem = leaf.file_stem().unwrap_or_default().to_string_lossy();
+            let ext = leaf.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+            let mut candidate = leaf.to_string_lossy().into_owned();
+            let mut n = 2;
+            while !used.insert(candidate.to_lowercase()) {
+                candidate = format!("{stem} ({n}){ext}"); n += 1;
+            }
+            let dest = folder.join(candidate);
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&dest)
+                .map_err(|_| "그림을 임시 파일로 쓸 수 없습니다".to_string())?;
+            file.write_all(&bytes).and_then(|_| file.flush())
+                .map_err(|_| "그림을 임시 파일로 쓸 수 없습니다".to_string())?;
+            out.push(dest);
+        }
+        Ok(out)
+    })();
+    if result.is_err() { let _ = std::fs::remove_dir_all(&folder); }
+    result
+}
+
+pub fn cleanup_extracted() { cleanup_at(&extraction_root(), std::time::SystemTime::now()); }
+
+fn cleanup_at(root: &Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(root) else { return; };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.path().symlink_metadata() else { continue; };
+        if !meta.is_dir() || meta.file_type().is_symlink() { continue; }
+        if meta.modified().ok().and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > std::time::Duration::from_secs(24 * 3600)) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +259,44 @@ mod tests {
         let mut b = Cursor::new(Vec::new());
         image::RgbaImage::new(3, 5).write_to(&mut b, image::ImageFormat::Png).unwrap();
         b.into_inner()
+    }
+    #[test] fn extract_flattens_names_and_preserves_bytes() {
+        let t = Temp::new(); let p = t.0.join("copy.zip");
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&p).unwrap());
+        let names = ["a/001.jpg", "b/001.jpg", "002.png"];
+        for (i, name) in names.iter().enumerate() {
+            w.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            w.write_all(&[i as u8; 3]).unwrap();
+        }
+        w.finish().unwrap();
+        let root = t.0.join("out");
+        let paths: Vec<_> = names.iter().map(|n| p.join(n)).collect();
+        assert_eq!(extract_for_drag(&vec![paths[0].clone(); 501]).unwrap_err(), "끌어놓기는 500개까지 됩니다");
+        let out = extract_into(&paths, &root, None).unwrap();
+        assert_eq!(out.iter().map(|p| p.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["001.jpg", "001 (2).jpg", "002.png"]);
+        for (i, p) in out.iter().enumerate() { assert_eq!(std::fs::read(p).unwrap(), [i as u8; 3]); }
+        assert!(extract_into(&paths, &root, Some(8)).is_err());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    }
+    #[test] fn extract_bad_entry_removes_partial_folder() {
+        let t = Temp::new(); let p = t.zip(); let root = t.0.join("out");
+        for bad in ["missing.png", "../bad.png"] {
+            let out = extract_into(&[p.join("1.png"), p.join(bad)], &root, None);
+            assert!(out.is_err());
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        }
+    }
+    #[test] fn cleanup_keeps_fresh_folders() {
+        use std::time::{Duration, SystemTime};
+        let t = Temp::new(); let old = t.0.join("old"); let fresh = t.0.join("fresh");
+        std::fs::create_dir(&old).unwrap(); std::fs::create_dir(&fresh).unwrap();
+        let now = SystemTime::now();
+        // A directory needs FILE_FLAG_BACKUP_SEMANTICS on Windows.
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).custom_flags(0x02000000).open(&old).unwrap()
+            .set_modified(now - Duration::from_secs(25 * 3600)).unwrap();
+        cleanup_at(&t.0, now);
+        assert!(!old.exists()); assert!(fresh.exists());
     }
     fn check(p: &Path) {
         let v = list_images(p).unwrap();

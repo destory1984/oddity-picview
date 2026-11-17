@@ -50,7 +50,7 @@ pub fn is_wic(path: &Path) -> bool {
 }
 
 pub fn is_image(path: &Path) -> bool {
-    ext_in(path, IMG_EXTS) || is_wic(path)
+    ext_in(path, IMG_EXTS) || is_wic(path) || crate::model::is_model(path)
 }
 
 pub fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
@@ -140,6 +140,14 @@ fn decode_jpeg_scaled(bytes: &[u8], max: u32) -> Option<DynamicImage> {
 }
 
 pub fn make_thumb(path: &Path) -> Result<RgbaImage, String> {
+    if crate::model::is_model(path) {
+        let img = DynamicImage::ImageRgba8(crate::model::load_thumbnail(path)?);
+        return Ok(if img.width() > THUMB_MAX || img.height() > THUMB_MAX {
+            img.thumbnail(THUMB_MAX, THUMB_MAX).to_rgba8()
+        } else {
+            img.to_rgba8()
+        });
+    }
     if is_wic(path) {
         return crate::fileops::wic_decode(path, THUMB_MAX).map(|(img, dims, o)| orient(img, dims, o).0);
     }
@@ -167,6 +175,14 @@ pub fn make_thumb(path: &Path) -> Result<RgbaImage, String> {
 /// Full decode for the preview / viewer. Returns the image (downscaled to fit
 /// `max_side` if needed) and the original oriented size.
 pub fn load_full(path: &Path, max_side: u32) -> Result<(RgbaImage, [u32; 2]), String> {
+    if crate::model::is_model(path) {
+        let mut img = DynamicImage::ImageRgba8(crate::model::load_thumbnail(path)?);
+        let dims = [img.width(), img.height()];
+        if img.width() > max_side || img.height() > max_side {
+            img = img.resize(max_side, max_side, image::imageops::FilterType::Triangle);
+        }
+        return Ok((img.to_rgba8(), dims));
+    }
     if is_wic(path) {
         return crate::fileops::wic_decode(path, max_side).map(|(img, dims, o)| orient(img, dims, o));
     }

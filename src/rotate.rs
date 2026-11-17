@@ -10,6 +10,9 @@ use std::path::Path;
 
 /// Rotate the file at `path` by `quarter_cw` quarter turns clockwise.
 pub fn save_rotation(path: &Path, quarter_cw: i32) -> Result<(), String> {
+    if crate::model::is_model(path) {
+        return Err("Blender, VRM 파일은 파일 회전을 지원하지 않습니다 (보기만 돌립니다)".into());
+    }
     let q = quarter_cw.rem_euclid(4);
     if q == 0 {
         return Ok(());
@@ -38,13 +41,25 @@ pub fn save_rotation(path: &Path, quarter_cw: i32) -> Result<(), String> {
 }
 
 /// Write next to the target, then rename over it, so a failure never leaves a broken file.
-fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension(format!("picview-{}.tmp", std::process::id()));
-    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        e.to_string()
-    })
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let (tmp, mut file) = loop {
+        let mut name = path.file_name().ok_or("파일 이름이 없습니다")?.to_os_string();
+        name.push(format!(".picview-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let tmp = path.with_file_name(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let result = file.write_all(data).and_then(|_| file.sync_all());
+    drop(file);
+    let result = result.and_then(|_| std::fs::rename(&tmp, path));
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result.map_err(|e| e.to_string())
 }
 
 /// EXIF orientation that shows the picture as orientation `cur` followed by `q` clockwise turns.
@@ -275,5 +290,19 @@ mod tests {
         assert_eq!(r.dimensions(), (2, 4));
         assert_eq!(r, image::imageops::rotate90(&img));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_does_not_overwrite_another_temporary_file() {
+        let dir = Path::new("target/alt/atomic-test");
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("photo.jpg");
+        let reserved = path.with_extension(format!("picview-{}.tmp", std::process::id()));
+        std::fs::write(&reserved, b"another write").unwrap();
+        write_atomic(&path, b"new bytes").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new bytes");
+        assert_eq!(std::fs::read(&reserved).unwrap(), b"another write");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(reserved).unwrap();
     }
 }

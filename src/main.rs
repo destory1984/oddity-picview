@@ -6,6 +6,8 @@ mod cache;
 mod fileops;
 mod icons;
 mod loader;
+mod meta;
+mod model;
 mod rotate;
 mod pane;
 mod watch;
@@ -133,6 +135,9 @@ enum Big {
 }
 
 enum Msg {
+    ArchiveCopied { request: u64, sequence: u32, res: Result<Vec<PathBuf>, String> },
+    Exif { key: MetaKey, request: u64, summary: Option<Arc<meta::ExifSummary>> },
+    Stripped { paths: Vec<PathBuf>, status: String },
     ArchiveListed { pane: usize, request: u64, path: PathBuf, stamp: Option<(u64, SystemTime)>, res: Result<Vec<archive::ArchiveEntry>, String> },
     DirChanged { dir: PathBuf },
     Thumb { pane: usize, gen: u64, idx: usize, mtime: SystemTime, tex: TextureHandle },
@@ -150,6 +155,7 @@ enum Msg {
 /// Commands from menus and shortcuts. Queued and run after the frame is drawn,
 /// because most of them change `entries` or the folder tree.
 enum Action {
+    StripPrivate(Vec<PathBuf>),
     Open(usize, usize),
     ToggleFullscreen,
     CloseViewer,
@@ -256,6 +262,7 @@ struct Viewer {
 }
 
 enum Dialog {
+    StripPrivate(Vec<PathBuf>),
     Delete(Vec<PathBuf>),
     Rename { path: PathBuf, text: String, first: bool },
     NewFolder { parent: PathBuf, text: String, first: bool },
@@ -264,6 +271,10 @@ enum Dialog {
 // ---------------------------------------------------------------- app
 
 struct App {
+    meta_cache: HashMap<MetaKey, MetaState>,
+    meta_request: u64,
+    privacy_saving: HashSet<PathBuf>,
+    transfers_running: usize,
     archive_catalog: ArchiveCatalog,
     hwnd: windows::Win32::Foundation::HWND,
     panes: Vec<Pane>,
@@ -301,6 +312,7 @@ struct App {
     actions: Vec<Action>,
     /// files cut to the clipboard by us, drawn faded until pasted
     cut_paths: HashSet<PathBuf>,
+    clipboard_request: u64,
     ctrl_v_prev: bool,
     /// rotation (quarter turns) being written to each file right now
     rot_saving: HashMap<PathBuf, i32>,
@@ -333,6 +345,12 @@ struct ArchiveListing {
     images: std::sync::OnceLock<Result<Vec<archive::ArchiveEntry>, String>>,
 }
 type ArchiveCatalog = Arc<std::sync::Mutex<HashMap<PathBuf, Arc<ArchiveListing>>>>;
+type MetaKey = (PathBuf, Option<(u64, SystemTime)>);
+
+enum MetaState {
+    Pending(u64),
+    Ready(Option<Arc<meta::ExifSummary>>),
+}
 
 fn archive_stamp(path: &Path) -> Option<(u64, SystemTime)> {
     std::fs::metadata(path).ok().map(|m| (m.len(), m.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
@@ -345,6 +363,23 @@ fn watch_dir(path: &Path) -> PathBuf {
 
 fn archive_read_only(path: &Path) -> bool {
     archive::split(path).is_some()
+}
+
+fn archive_action_error(a: &Action) -> Option<&'static str> {
+    match a {
+        Action::Cut(ps) | Action::PickAndTransfer(ps, true) | Action::Transfer(ps, _, true)
+            if ps.iter().any(|p| archive_read_only(p)) =>
+                return Some("압축 파일 안의 그림은 옮길 수 없습니다. 복사만 됩니다"),
+        _ => {}
+    }
+    let blocked = match a {
+        Action::Delete(ps) => ps.iter().any(|p| archive_read_only(p)),
+        Action::Rename(p) | Action::Properties(p) | Action::ShowInExplorer(p) => archive_read_only(p),
+        Action::Paste(p) | Action::NewFolder(p) => archive::is_location(p) || archive_read_only(p),
+        Action::Transfer(_, d, _) => archive::is_location(d) || archive_read_only(d),
+        _ => false,
+    };
+    blocked.then_some("압축 파일 안에서는 할 수 없습니다")
 }
 
 fn cached_archive(catalog: &ArchiveCatalog, path: &Path) -> Result<Vec<archive::ArchiveEntry>, String> {
@@ -406,6 +441,7 @@ impl App {
     }
 
     fn new(cc: &eframe::CreationContext<'_>, start: Option<PathBuf>) -> Self {
+        std::thread::spawn(archive::cleanup_extracted);
         let hwnd = match cc.window_handle().expect("main window handle").as_raw() {
             RawWindowHandle::Win32(handle) => {
                 windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut std::ffi::c_void)
@@ -426,6 +462,10 @@ impl App {
         let limit = saved.cache_max_mb.clamp(CACHE_MIN_MB, CACHE_MAX_MB) * 1024 * 1024;
         std::thread::spawn(move || cache::trim(limit));
         let mut app = App {
+            meta_cache: HashMap::new(),
+            meta_request: 0,
+            privacy_saving: HashSet::new(),
+            transfers_running: 0,
             archive_catalog: Arc::default(),
             hwnd,
             panes: vec![Pane::new()],
@@ -455,6 +495,7 @@ impl App {
             favorites: saved.favorites.clone(),
             actions: Vec::new(),
             cut_paths: HashSet::new(),
+            clipboard_request: 0,
             ctrl_v_prev: false,
             rot_saving: HashMap::new(),
             baked: HashMap::new(),
@@ -1055,6 +1096,10 @@ impl App {
     fn rotate_paths(&mut self, paths: Vec<PathBuf>, d: i32) {
         if self.reject_archive(&paths) { return; }
         for p in paths {
+            if self.privacy_saving.contains(&p) {
+                self.status = "개인 정보를 지우는 중입니다".into();
+                continue;
+            }
             if !loader::is_image(&p) {
                 continue;
             }
@@ -1065,6 +1110,10 @@ impl App {
     }
 
     fn save_rotation(&mut self, p: &Path) {
+        if model::is_model(p) {
+            self.status = "Blender, VRM 파일은 파일 회전을 지원하지 않습니다 (보기만 돌립니다)".into();
+            return;
+        }
         if self.reject_archive(&[p.to_path_buf()]) { return; }
         let turns = self.rot_of(p);
         if turns == 0 || self.rot_saving.contains_key(p) {
@@ -1085,6 +1134,7 @@ impl App {
             self.status = format!("회전 저장 실패: {e}");
             return;
         }
+        self.meta_cache.retain(|(p, _), _| p != &path);
         // the file now holds `turns`; textures already loaded do not
         let left = (self.rot_of(&path) - turns).rem_euclid(4);
         if left == 0 {
@@ -1233,6 +1283,36 @@ impl App {
     fn poll_msgs(&mut self) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
+                Msg::Exif { key, request, summary } => {
+                    if matches!(self.meta_cache.get(&key), Some(MetaState::Pending(n)) if *n == request) {
+                        self.meta_cache.insert(key, MetaState::Ready(summary));
+                    }
+                }
+                Msg::Stripped { paths, status } => {
+                    let mut dirs = HashSet::new();
+                    for path in paths {
+                        self.privacy_saving.remove(&path);
+                        self.meta_cache.retain(|(p, _), _| p != &path);
+                        self.big.remove(&path);
+                        self.big_order.retain(|p| p != &path);
+                        self.anims.remove(&path);
+                        for pane in &mut self.panes {
+                            if let Some(i) = pane.index_of(&path) {
+                                if matches!(pane.thumbs[i], Thumb::Ready(_)) { pane.thumbs_loaded = pane.thumbs_loaded.saturating_sub(1); }
+                                pane.thumbs[i] = Thumb::None;
+                            }
+                        }
+                        if let Some(parent) = path.parent() { dirs.insert(parent.to_path_buf()); }
+                    }
+                    for dir in dirs { self.refresh_dir(&dir); }
+                    if let Some(v) = &self.viewer {
+                        if let Some(e) = self.panes[v.pane].entries.get(v.idx) {
+                            let path = e.path.clone();
+                            self.request_big(&path);
+                        }
+                    }
+                    self.status = status;
+                }
                 Msg::ArchiveListed { pane, request, path, stamp, res } => {
                     if !self.panes.get(pane).is_some_and(|p| p.cur_dir == path && p.archive_request == request) { continue; }
                     if stamp != archive_stamp(&path) {
@@ -1287,7 +1367,15 @@ impl App {
                         self.anims.insert(path, Anim { frames, total, start: Instant::now() });
                     }
                 }
+                Msg::ArchiveCopied { request, sequence, res } => {
+                    if request != self.clipboard_request || sequence != fileops::clipboard_sequence() { continue; }
+                    match res.and_then(|paths| fileops::clipboard_set_files(&paths, false).map(|_| paths.len())) {
+                        Ok(n) => { self.cut_paths.clear(); self.status = format!("{n}개 항목을 복사했습니다"); }
+                        Err(e) => self.status = format!("복사 실패: {e}"),
+                    }
+                }
                 Msg::OpDone { status, dirs, clear_clipboard } => {
+                    self.transfers_running = self.transfers_running.saturating_sub(1);
                     self.status = status;
                     if clear_clipboard {
                         fileops::clipboard_clear();
@@ -1341,6 +1429,72 @@ impl App {
 
     // ------------------------------------------------------------ file ops
 
+    fn request_exif(&mut self, path: &Path) -> MetaKey {
+        let key = (path.to_path_buf(), self.file_stamp(path));
+        if self.meta_cache.contains_key(&key) { return key; }
+        if self.meta_cache.len() >= 128 { self.meta_cache.clear(); }
+        self.meta_request += 1;
+        let request = self.meta_request;
+        self.meta_cache.insert(key.clone(), MetaState::Pending(request));
+        let (tx, ctx, result_key) = (self.tx.clone(), self.ctx.clone(), key.clone());
+        std::thread::spawn(move || {
+            let summary = meta::read_summary(&result_key.0).map(Arc::new);
+            let _ = tx.send(Msg::Exif { key: result_key, request, summary });
+            ctx.request_repaint();
+        });
+        key
+    }
+
+    fn reject_saving(&mut self, paths: &[PathBuf]) -> bool {
+        let busy = paths.iter().any(|p| self.privacy_saving.iter().chain(self.rot_saving.keys()).any(|saving| saving.starts_with(p)));
+        if busy { self.status = "파일을 저장하는 중입니다. 끝난 뒤 다시 시도하세요".into(); }
+        busy
+    }
+
+    fn ask_strip_private(&mut self, paths: Vec<PathBuf>) {
+        if paths.iter().any(|p| model::is_model(p)) {
+            self.status = "Blender, VRM 파일은 개인 정보 지우기를 지원하지 않습니다".into();
+        }
+        let mut seen = HashSet::new();
+        let paths: Vec<_> = paths.into_iter().filter(|p| meta::can_strip(p) && seen.insert(p.clone())).collect();
+        if !paths.is_empty() { self.dialog = Some(Dialog::StripPrivate(paths)); }
+    }
+
+    fn do_strip_private(&mut self, paths: Vec<PathBuf>) {
+        if self.transfers_running > 0 || paths.iter().any(|p| self.rot_saving.contains_key(p) || self.privacy_saving.contains(p)) {
+            self.status = "파일을 저장하는 중입니다. 끝난 뒤 다시 시도하세요".into();
+            return;
+        }
+        self.privacy_saving.extend(paths.iter().cloned());
+        self.status = "개인 정보를 지우는 중입니다".into();
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let (mut done, mut failed, mut lost) = (0, 0, 0);
+            let mut first = None;
+            for path in &paths {
+                let stamp = archive_stamp(path);
+                match meta::strip_file(path) {
+                    Ok(orientation_lost) => {
+                        done += 1;
+                        lost += usize::from(orientation_lost);
+                        if let Some((size, time)) = stamp { cache::invalidate(path, size, time); }
+                    }
+                    Err(reason) => {
+                        failed += 1;
+                        if first.is_none() {
+                            first = Some(format!("{} - {reason}", path.file_name().unwrap_or_default().to_string_lossy()));
+                        }
+                    }
+                }
+            }
+            let mut status = format!("{done}개 지움, {failed}개 실패");
+            if let Some(first) = first { status.push_str(&format!(" (첫 실패: {first})")); }
+            if lost > 0 { status.push_str(&format!(" · {lost}개 WebP는 VP8X가 없어 방향을 보존하지 못했습니다")); }
+            let _ = tx.send(Msg::Stripped { paths, status });
+            ctx.request_repaint();
+        });
+    }
+
     fn ask_delete(&mut self, paths: Vec<PathBuf>) {
         if self.reject_archive(&paths) { return; }
         // drive roots cannot go to the recycle bin
@@ -1356,6 +1510,7 @@ impl App {
     }
 
     fn do_delete(&mut self, paths: Vec<PathBuf>) {
+        if self.reject_saving(&paths) { return; }
         if self.reject_archive(&paths) { return; }
         match trash::delete_all(&paths) {
             Ok(()) => self.status = format!("{}개 항목을 휴지통으로 보냈습니다", paths.len()),
@@ -1452,6 +1607,7 @@ impl App {
     }
 
     fn do_rename(&mut self, path: PathBuf, new_name: &str) {
+        if self.reject_saving(std::slice::from_ref(&path)) { return; }
         if self.reject_archive(std::slice::from_ref(&path)) { return; }
         let new_name = new_name.trim();
         if new_name.is_empty() {
@@ -1499,14 +1655,10 @@ impl App {
     }
 
     fn run(&mut self, a: Action) {
-        let blocked = match &a {
-            Action::Cut(ps) | Action::Copy(ps) | Action::Delete(ps) | Action::PickAndTransfer(ps, _) => ps.iter().any(|p| archive_read_only(p)),
-            Action::Rename(p) | Action::Properties(p) | Action::ShowInExplorer(p) => archive_read_only(p),
-            Action::Paste(p) | Action::NewFolder(p) => archive::is_location(p) || archive_read_only(p),
-            Action::Transfer(ps, d, _) => archive::is_location(d) || archive_read_only(d) || ps.iter().any(|p| archive_read_only(p)),
-            _ => false,
-        };
-        if blocked { self.status = "압축 파일 안에서는 할 수 없습니다".into(); return; }
+        if matches!(&a, Action::Copy(_) | Action::Cut(_)) {
+            self.clipboard_request = self.clipboard_request.wrapping_add(1);
+        }
+        if let Some(reason) = archive_action_error(&a) { self.status = reason.into(); return; }
         match a {
             Action::Open(pi, i) => self.open_entry(pi, i),
             Action::ToggleFullscreen => self.toggle_fullscreen(),
@@ -1528,6 +1680,16 @@ impl App {
                 }
                 Err(e) => self.status = format!("잘라내기 실패: {e}"),
             },
+            Action::Copy(ps) if ps.iter().any(|p| archive_read_only(p)) => {
+                self.status = "복사하는 중…".into();
+                let request = self.clipboard_request;
+                let sequence = fileops::clipboard_sequence();
+                let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(Msg::ArchiveCopied { request, sequence, res: archive::extract(&ps) });
+                    ctx.request_repaint();
+                });
+            }
             Action::Copy(ps) => match fileops::clipboard_set_files(&ps, false) {
                 Ok(()) => {
                     self.status = format!("{}개 항목을 복사했습니다", ps.len());
@@ -1537,6 +1699,7 @@ impl App {
             },
             Action::Paste(dest) => self.paste(dest),
             Action::Delete(ps) => self.ask_delete(ps),
+            Action::StripPrivate(ps) => self.ask_strip_private(ps),
             Action::Rename(p) => self.ask_rename_path(p),
             Action::Properties(p) => fileops::show_properties(&p),
             Action::Refresh(d) => self.refresh_dir(&d),
@@ -1583,6 +1746,8 @@ impl App {
             false
         } else if m.shift {
             true
+        } else if !files.is_empty() && files.iter().all(|p| archive_read_only(p)) {
+            false
         } else {
             files.first().is_some_and(|f| same_volume(f, dest))
         }
@@ -1590,7 +1755,7 @@ impl App {
 
     /// Make `resp` (a folder) accept dragged files.
     fn drop_target(&mut self, ui: &Ui, resp: &egui::Response, dir: &Path) {
-        if archive::is_location(&self.pane().cur_dir) || archive::is_location(dir) || archive_read_only(dir) {
+        if archive::is_location(dir) || archive_read_only(dir) {
             if resp.dnd_hover_payload::<DragFiles>().is_some() { self.status = "압축 파일 안에서는 할 수 없습니다".into(); }
             return;
         }
@@ -1633,7 +1798,9 @@ impl App {
             egui::DragAndDrop::clear_payload(ctx);
             self.dnd_target = None;
             let n = files.len();
-            match fileops::drag_out(self.hwnd, &files) {
+            let from_archive = files.iter().any(|p| archive_read_only(p));
+            let prepared = if from_archive { archive::extract_for_drag(&files) } else { Ok(files) };
+            match prepared.and_then(|files| fileops::drag_out(self.hwnd, &files, from_archive)) {
                 Ok(0) => {}
                 Ok(_) => self.status = format!("{n}개 항목을 다른 프로그램에 넘겼습니다"),
                 Err(e) => self.status = format!("끌어놓기 실패: {e}"),
@@ -1652,7 +1819,9 @@ impl App {
             }
             None => {
                 ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                format!("{}개 항목 (Ctrl: 복사, Shift: 이동)", drag.0.len())
+                if drag.0.iter().all(|p| archive_read_only(p)) {
+                    format!("{}개 항목 (복사)", drag.0.len())
+                } else { format!("{}개 항목 (Ctrl: 복사, Shift: 이동)", drag.0.len()) }
             }
         };
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("dnd_label")));
@@ -1677,8 +1846,9 @@ impl App {
 
     /// Copy or move `files` into `dest` on a worker thread with Explorer's dialogs.
     fn transfer(&mut self, files: Vec<PathBuf>, dest: PathBuf, cut: bool, from_clipboard: bool) {
-        if archive::is_location(&dest) || self.reject_archive(&files) || self.reject_archive(std::slice::from_ref(&dest)) {
-            self.status = "압축 파일 안에서는 할 수 없습니다".into(); return;
+        if self.reject_saving(&files) || self.reject_saving(std::slice::from_ref(&dest)) { return; }
+        if let Some(reason) = archive_action_error(&Action::Transfer(files.clone(), dest.clone(), cut)) {
+            self.status = reason.into(); return;
         }
         if files.is_empty() {
             return;
@@ -1706,8 +1876,11 @@ impl App {
         let n = files.len();
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         self.status = format!("{}하는 중…", if cut { "옮기" } else { "복사" });
+        self.transfers_running += 1;
         std::thread::spawn(move || {
-            let res = fileops::shell_copy_move(&files, &dest, cut);
+            let res = if files.iter().any(|p| archive_read_only(p)) {
+                archive::extract(&files).and_then(|extracted| fileops::shell_copy_move(&extracted, &dest, false))
+            } else { fileops::shell_copy_move(&files, &dest, cut) };
             let status = match &res {
                 Ok(true) => format!("{n}개 항목을 {}습니다", if cut { "옮겼" } else { "복사했" }),
                 Ok(false) => "일부를 취소했습니다".into(),
@@ -1759,6 +1932,11 @@ impl App {
                     extra.push(add("크게보기".into(), Action::Open(pi, i)));
                 }
             }
+            let eligible: Vec<_> = targets.iter().filter(|p| meta::can_strip(p)).cloned().collect();
+            let enabled = !eligible.is_empty();
+            let mut strip = add("개인 정보 지우기".into(), Action::StripPrivate(eligible));
+            strip.enabled = enabled;
+            extra.push(strip);
             for (label, mv) in [("복사할 곳", false), ("이동할 곳", true)] {
                 let mut submenu = Vec::new();
                 for dest in self.transfer_dirs.iter().take(TRANSFER_MAX) {
@@ -1804,6 +1982,11 @@ impl App {
     /// area); `dir` is the folder that "new folder", "paste" and "refresh" use.
     fn file_menu(&mut self, ui: &mut Ui, targets: Vec<PathBuf>, dir: PathBuf) {
         if archive::is_archive(&dir) && dir.is_file() {
+            if !targets.is_empty() {
+                if ui.button("복사(C)").clicked() { self.actions.push(Action::Copy(targets.clone())); ui.close_menu(); }
+                ui.menu_button("복사할 곳", |ui| self.dest_menu(ui, &targets, false));
+            }
+            ui.add_enabled(false, egui::Button::new("개인 정보 지우기"));
             if let Some(path) = targets.first() {
                 if ui.button("경로 복사").clicked() { ui.ctx().copy_text(path.display().to_string()); ui.close_menu(); }
             } else if ui.button("경로 복사").clicked() { ui.ctx().copy_text(dir.display().to_string()); ui.close_menu(); }
@@ -1849,6 +2032,10 @@ impl App {
         icons::menu_sep(ui);
         if item(ui, Some(&ic.delete), deletable, "삭제(D)", "Del") {
             act = Some(Action::Delete(targets.clone()));
+        }
+        let eligible: Vec<_> = targets.iter().filter(|p| meta::can_strip(p)).cloned().collect();
+        if item(ui, None, !eligible.is_empty(), "개인 정보 지우기", "") {
+            act = Some(Action::StripPrivate(eligible));
         }
         if item(ui, Some(&ic.rename), targets.len() == 1 && deletable, "이름 변경(U)", "F2") {
             act = Some(Action::Rename(targets[0].clone()));
@@ -2001,8 +2188,9 @@ impl App {
             )
         });
         if archive::is_location(&self.pane().cur_dir)
-            && (copy || cut || pressed(Key::Delete) || pressed(Key::F2)) {
-            self.status = "압축 파일 안에서는 할 수 없습니다".into();
+            && (cut || pressed(Key::Delete) || pressed(Key::F2)) {
+            self.status = if cut { "압축 파일 안의 그림은 옮길 수 없습니다. 복사만 됩니다" }
+                else { "압축 파일 안에서는 할 수 없습니다" }.into();
             return;
         }
         if copy {
@@ -2622,20 +2810,13 @@ impl App {
         if resp.double_clicked() {
             self.actions.push(Action::Up);
         }
-        if !archive::is_location(&self.panes[pi].cur_dir) {
-            self.drop_target(ui, &resp, &parent);
-        } else if resp.dnd_hover_payload::<DragFiles>().is_some() {
-            self.status = "압축 파일 안에서는 할 수 없습니다".into();
-        }
+        self.drop_target(ui, &resp, &parent);
     }
 
     fn cell(&mut self, ui: &mut Ui, pi: usize, i: usize, rect: Rect) {
         let resp = ui.interact(rect, ui.id().with(("cell", i)), Sense::click_and_drag());
         if resp.clicked() || resp.secondary_clicked() || resp.drag_started() { self.activate(pi); }
-        if resp.drag_started() && archive::is_location(&self.panes[pi].cur_dir) {
-            self.status = "압축 파일 안에서는 할 수 없습니다".into();
-        }
-        if resp.drag_started() && !archive::is_location(&self.panes[pi].cur_dir) {
+        if resp.drag_started() {
             if !self.panes[pi].selected.contains(&i) {
                 self.select_single(pi, i);
             }
@@ -2751,6 +2932,8 @@ impl App {
         if archive::is_archive(&dir) && dir.is_file() {
             resp.context_menu(|ui| {
                 if ui.button("크게보기").clicked() { self.actions.push(Action::Open(pi, i)); ui.close_menu(); }
+                if ui.button("복사(C)").clicked() { self.actions.push(Action::Copy(targets.clone())); ui.close_menu(); }
+                ui.menu_button("복사할 곳", |ui| self.dest_menu(ui, &targets, false));
                 if ui.button("경로 복사").clicked() { ui.ctx().copy_text(path.display().to_string()); ui.close_menu(); }
             });
             return;
@@ -2843,7 +3026,9 @@ impl App {
             }
             return;
         }
-        let area_h = (ui.available_height() - 90.0).max(60.0);
+        let path = e.path.clone();
+        let is_img = e.is_img();
+        let area_h = (ui.available_height() * 0.5).max(60.0);
         let (area, resp) = ui.allocate_exact_size(vec2(ui.available_width(), area_h), Sense::click());
         match (self.big.get(&e.path), &self.panes[self.active].thumbs[i]) {
             (Some(Big::Ready(t, d)), _) => {
@@ -2863,13 +3048,49 @@ impl App {
             _ => {}
         }
         let open = resp.double_clicked();
+        let (name, size, modified) = (e.name.clone(), e.size, e.modified);
+        let key = (is_img && !model::is_model(&path)).then(|| self.request_exif(&path));
         ui.add_space(6.0);
-        ui.label(egui::RichText::new(&e.name).strong());
-        if let Some([w, h]) = self.panes[self.active].focus_dims {
-            ui.label(format!("{w} x {h}"));
-        }
-        ui.label(fmt_size(e.size));
-        ui.label(fmt_time(e.modified));
+        egui::ScrollArea::vertical().id_salt(("preview_metadata", &path))
+            .auto_shrink([false, false]).max_height(ui.available_height()).show(ui, |ui| {
+                ui.label(egui::RichText::new(name).strong());
+                if let Some([w, h]) = self.panes[self.active].focus_dims { ui.label(format!("{w} x {h}")); }
+                ui.label(fmt_size(size));
+                ui.label(fmt_time(modified));
+                if let Some(key) = key {
+                    ui.separator();
+                    ui.label(egui::RichText::new("촬영 정보").strong());
+                    match self.meta_cache.get(&key) {
+                        Some(MetaState::Ready(Some(s))) => {
+                            let camera = [s.make.as_deref(), s.model.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" ");
+                            if !camera.is_empty() { ui.label(format!("카메라 {camera}")); }
+                            if let Some(lens) = &s.lens { ui.label(format!("렌즈 {lens}")); }
+                            if let Some(taken) = &s.taken { ui.label(format!("찍은 때 {taken}")); }
+                            let settings = [&s.f_number, &s.exposure, &s.iso, &s.focal].into_iter().filter_map(|s| s.as_deref()).collect::<Vec<_>>().join(" · ");
+                            if !settings.is_empty() { ui.label(format!("설정 {settings}")); }
+                            if let Some((lat, lon)) = s.gps {
+                                ui.colored_label(Color32::from_rgb(200, 40, 40), format!("⚠ 위치 {lat:.5}, {lon:.5}"));
+                            }
+                        }
+                        Some(MetaState::Ready(None)) => { ui.weak("촬영 정보 없음"); }
+                        _ => { ui.weak("촬영 정보 읽는 중…"); }
+                    }
+                    if ui.add_enabled(meta::can_strip(&path) && !self.privacy_saving.contains(&path), egui::Button::new("개인 정보 지우기")).clicked() {
+                        self.actions.push(Action::StripPrivate(vec![path.clone()]));
+                    }
+                    if let Some(MetaState::Ready(Some(s))) = self.meta_cache.get(&key) {
+                        egui::CollapsingHeader::new("자세히").id_salt(&path).show(ui, |ui| {
+                            egui::Grid::new(("exif_tags", &path)).num_columns(2).striped(true).show(ui, |ui| {
+                                for (name, value) in &s.all {
+                                    ui.add(egui::Label::new(name).wrap());
+                                    ui.add(egui::Label::new(value).wrap());
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                    }
+                }
+            });
         if open {
             self.open_entry(self.active, i);
         }
@@ -3039,6 +3260,13 @@ impl App {
         if !self.modal_open() && !menu_was_open && open_menu_at.is_none() {
             let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
             let mods = ctx.input(|i| i.modifiers);
+            let (copy, cut) = ctx.input(|i| (
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+            ));
+            let current = &self.panes[pi].entries[idx].path;
+            if copy { self.actions.push(Action::Copy(vec![current.clone()])); }
+            if cut { self.actions.push(Action::Cut(vec![current.clone()])); }
             let mut go: Option<usize> = None;
             if pressed(Key::Escape) || pressed(Key::Enter) {
                 self.close_viewer();
@@ -3235,6 +3463,13 @@ impl App {
                     }
                     if icons::menu_item(ui, None, "경로 복사", "", true).clicked() {
                         ctx.copy_text(cur.display().to_string());
+                    }
+                    if icons::menu_item(ui, None, "복사(C)", "Ctrl+C", true).clicked() {
+                        action = Some(Action::Copy(vec![cur.clone()]));
+                    }
+                    ui.menu_button("복사할 곳", |ui| self.dest_menu(ui, std::slice::from_ref(&cur), false));
+                    if icons::menu_item(ui, None, "개인 정보 지우기", "", meta::can_strip(&cur)).clicked() {
+                        action = Some(Action::StripPrivate(vec![cur.clone()]));
                     }
                     if icons::menu_item(ui, None, "목록으로 돌아가기 (Esc)", "", true).clicked() {
                         action = Some(Action::CloseViewer);
@@ -3524,11 +3759,12 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.dialog.take() else { return };
+        let strip = matches!(&dialog, Dialog::StripPrivate(_));
         let enter = ctx.input(|i| i.key_pressed(Key::Enter));
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
         match dialog {
             // layout and colours from a GPT (Codex) proposal, styled only inside this window
-            Dialog::Delete(paths) => {
+            Dialog::Delete(paths) | Dialog::StripPrivate(paths) => {
                 use egui::{Color32 as C, CornerRadius, Frame, RichText, Stroke, vec2};
                 let text = C::from_rgb(36, 48, 60);
                 let muted = C::from_rgb(111, 124, 140);
@@ -3555,7 +3791,7 @@ impl App {
                         offset: [0, 4], blur: 12, spread: 0, color: C::from_black_alpha(32),
                     });
                 let mut result: Option<bool> = None;
-                egui::Window::new(RichText::new("삭제").size(18.0).color(text))
+                egui::Window::new(RichText::new(if strip { "개인 정보 지우기" } else { "삭제" }).size(18.0).color(text))
                     .collapsible(false).resizable(false)
                     .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                     .default_width(440.0).frame(frame).show(ctx, |ui| {
@@ -3584,7 +3820,9 @@ impl App {
                             ui.add_space(4.0);
                             ui.vertical(|ui| {
                                 ui.set_width(388.0);
-                                let prompt = if paths.len() == 1 {
+                                let prompt = if strip {
+                                    format!("{}개 파일의 촬영 정보와 위치를 지웁니다. 되돌릴 수 없습니다.", paths.len())
+                                } else if paths.len() == 1 {
                                     "이 항목을 휴지통으로 보낼까요?".to_owned()
                                 } else {
                                     format!("{}개 항목을 휴지통으로 보낼까요?", paths.len())
@@ -3615,14 +3853,14 @@ impl App {
                                         }
                                     });
                                 ui.label(RichText::new(&summary).size(12.0).color(muted));
-                                ui.label(RichText::new("휴지통에서 되살릴 수 있습니다")
+                                ui.label(RichText::new(if strip { "원본 파일에 덮어씁니다" } else { "휴지통에서 되살릴 수 있습니다" })
                                     .size(12.0).color(muted));
                             });
                         });
                         ui.add_space(8.0);
                         // fixed 30px row: a bare right_to_left layout took the whole window height
                         ui.allocate_ui_with_layout(vec2(ui.available_width(), 30.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let send = egui::Button::new(RichText::new("휴지통으로 보내기").color(danger))
+                            let send = egui::Button::new(RichText::new(if strip { "지우기" } else { "휴지통으로 보내기" }).color(danger))
                                 .shortcut_text(RichText::new("Enter").size(12.0).color(danger))
                                 .fill(C::from_rgb(255, 242, 240))
                                 .stroke(Stroke::new(1.0f32, C::from_rgb(233, 184, 177)));
@@ -3635,8 +3873,10 @@ impl App {
                 if enter { result = Some(true); }
                 if esc { result = Some(false); }
                 match result {
+                    Some(true) if strip => self.do_strip_private(paths),
                     Some(true) => self.do_delete(paths),
                     Some(false) => {}
+                    None if strip => self.dialog = Some(Dialog::StripPrivate(paths)),
                     None => self.dialog = Some(Dialog::Delete(paths)),
                 }
             }

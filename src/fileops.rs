@@ -66,6 +66,13 @@ pub fn clipboard_clear() {
     }
 }
 
+/// Detect clipboard changes while archive extraction runs in the background.
+pub fn clipboard_sequence() -> u32 {
+    #[link(name = "user32")]
+    extern "system" { fn GetClipboardSequenceNumber() -> u32; }
+    unsafe { GetClipboardSequenceNumber() }
+}
+
 /// Copy or move with Explorer's own progress / overwrite dialogs. Blocks; run on a worker thread.
 /// Returns Ok(false) if the user cancelled part of it.
 pub fn shell_copy_move(srcs: &[PathBuf], dest_dir: &Path, mv: bool) -> Result<bool, String> {
@@ -292,7 +299,7 @@ mod tests {
 /// programs (browser, Explorer, chat apps). Blocks until the drop ends; call on
 /// the UI thread (winit has already set it up for OLE). Returns the effect the
 /// target chose: 0 = cancelled, 1 = copy, 2 = move, 4 = link.
-pub fn drag_out(hwnd: windows::Win32::Foundation::HWND, paths: &[PathBuf]) -> Result<u32, String> {
+pub fn drag_out(hwnd: windows::Win32::Foundation::HWND, paths: &[PathBuf], copy_only: bool) -> Result<u32, String> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Com::IDataObject;
     use windows::Win32::System::Ole::{DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK};
@@ -318,7 +325,8 @@ pub fn drag_out(hwnd: windows::Win32::Foundation::HWND, paths: &[PathBuf]) -> Re
             let items: IShellItemArray = SHCreateShellItemArrayFromIDLists(&pidls)?;
             let data: IDataObject = items.BindToHandler(None, &BHID_DataObject)?;
             // copy or link only: a browser or chat app must never "move" (delete) the original
-            let effect: DROPEFFECT = SHDoDragDrop(Some(hwnd), &data, None, DROPEFFECT_COPY | DROPEFFECT_LINK)?;
+            let allowed = if copy_only { DROPEFFECT_COPY } else { DROPEFFECT_COPY | DROPEFFECT_LINK };
+            let effect: DROPEFFECT = SHDoDragDrop(Some(hwnd), &data, None, allowed)?;
             Ok(effect.0)
         })()
     };

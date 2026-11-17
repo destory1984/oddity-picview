@@ -79,6 +79,12 @@ pub fn load(path: &Path, size: u64, modified: SystemTime) -> Option<RgbaImage> {
     None
 }
 
+pub fn invalidate(path: &Path, size: u64, modified: SystemTime) {
+    if let Some(base) = entry_base(path, size, modified) {
+        for ext in ["jpg", "png"] { let _ = std::fs::remove_file(base.with_extension(ext)); }
+    }
+}
+
 /// Opaque thumbnails are stored as JPEG (small), ones with alpha as PNG.
 pub fn store(path: &Path, size: u64, modified: SystemTime, img: &RgbaImage) {
     let Some(base) = entry_base(path, size, modified) else { return };

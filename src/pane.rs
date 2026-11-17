@@ -358,6 +358,19 @@ mod tests {
         assert_eq!(restore_dir(Path::new("Q:/no/such"), Path::new("C:/")), pb("C:/"));
     }
 
+    #[test]
+    fn privacy_write_blocks_rename() {
+        let dir = temp_dir();
+        let path = dir.join("photo.jpg");
+        std::fs::write(&path, b"photo").unwrap();
+        let mut app = test_app(&dir);
+        app.privacy_saving.insert(path.clone());
+        app.do_rename(path.clone(), "moved.jpg");
+        let remained = path.exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(remained, "a privacy write must keep its original path");
+    }
+
     fn test_app(dir: &Path) -> crate::App {
         use crate::*;
         let ctx = egui::Context::default();
@@ -365,6 +378,10 @@ mod tests {
         let drives = Vec::new();
         let (tx, rx) = mpsc::channel();
         let mut app = App {
+            meta_cache: HashMap::new(),
+            meta_request: 0,
+            privacy_saving: HashSet::new(),
+            transfers_running: 0,
             archive_catalog: Arc::default(),
             hwnd: windows::Win32::Foundation::HWND::default(),
             panes: vec![Pane::new()],
@@ -394,6 +411,7 @@ mod tests {
             favorites: saved.favorites.clone(),
             actions: Vec::new(),
             cut_paths: HashSet::new(),
+            clipboard_request: 0,
             ctrl_v_prev: false,
             rot_saving: HashMap::new(),
             baked: HashMap::new(),
@@ -652,6 +670,50 @@ mod tests {
         app.go_fwd(); assert_eq!(app.panes[0].cur_dir, t);
         std::fs::remove_dir_all(t).unwrap();
     }
+    #[test] fn stale_archive_copy_cannot_replace_newer_clipboard_request() {
+        use crate::*;
+        let t = temp_dir(); let mut app = test_app(&t);
+        app.clipboard_request = 2;
+        app.status = "새 복사".into();
+        app.tx.send(Msg::ArchiveCopied { request: 1, sequence: fileops::clipboard_sequence(), res: Err("이전 복사".into()) }).unwrap();
+        app.poll_msgs();
+        assert_eq!(app.status, "새 복사");
+        app.tx.send(Msg::ArchiveCopied { request: 2, sequence: fileops::clipboard_sequence().wrapping_sub(1), res: Err("바뀐 클립보드".into()) }).unwrap();
+        app.poll_msgs();
+        assert_eq!(app.status, "새 복사");
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn archive_viewer_copy_shortcut_queues_current_picture() {
+        use crate::*;
+        let t = temp_dir(); let p = t.join("book.zip"); book(&p, &["1.png"]);
+        let mut app = test_app(&t); app.navigate(0, p.clone(), true); wait_book(&mut app, 0);
+        app.open_entry(0, 0);
+        let ctx = app.ctx.clone();
+        let input = egui::RawInput { events: vec![egui::Event::Copy], ..Default::default() };
+        let _ = ctx.run(input, |ctx| app.viewer_ui(ctx));
+        assert!(app.actions.iter().any(|a| matches!(a, Action::Copy(ps) if ps == &vec![p.join("1.png")])));
+        std::fs::remove_dir_all(t).unwrap();
+    }
+    #[test] fn archive_copy_decision() {
+        use crate::*;
+        let t = temp_dir(); let p = t.join("book.zip"); book(&p, &["1.png"]);
+        let inside = p.join("1.png");
+        assert_eq!(archive_action_error(&Action::Copy(vec![inside.clone()])), None);
+        assert_eq!(archive_action_error(&Action::Transfer(vec![inside.clone()], t.clone(), false)), None);
+        assert_eq!(archive_action_error(&Action::PickAndTransfer(vec![inside.clone()], false)), None);
+        assert_eq!(archive_action_error(&Action::Transfer(vec![inside.clone()], t.clone(), true)), Some("압축 파일 안의 그림은 옮길 수 없습니다. 복사만 됩니다"));
+        assert!(archive_action_error(&Action::Cut(vec![inside])).is_some());
+        assert!(archive_action_error(&Action::Transfer(vec![p.clone()], p.clone(), false)).is_some());
+        assert_eq!(archive_action_error(&Action::Transfer(vec![p], t.clone(), true)), None);
+        let app = test_app(&t);
+        let files = vec![t.join("book.zip").join("1.png")];
+        assert!(!app.drop_is_move(&files, &t));
+        app.ctx.input_mut(|i| i.modifiers.shift = true);
+        assert!(app.drop_is_move(&files, &t));
+        app.ctx.input_mut(|i| i.modifiers.ctrl = true);
+        assert!(!app.drop_is_move(&files, &t));
+        std::fs::remove_dir_all(t).unwrap();
+    }
     #[test] fn archive_blocks_mutations_and_reuses_preview_dimensions() {
         use crate::*;
         let t = temp_dir(); let p = t.join("book.cbz"); book(&p, &["1.png", "2.png"]);
@@ -659,11 +721,15 @@ mod tests {
         let mut app = test_app(&t); app.navigate(0, p.clone(), true); wait_book(&mut app, 0);
         let inside = app.panes[0].entries[0].path.clone();
         for action in [Action::Delete(vec![inside.clone()]), Action::Rename(inside.clone()),
-            Action::Cut(vec![inside.clone()]), Action::Copy(vec![inside.clone()]), Action::Paste(p.clone()),
-            Action::NewFolder(p.clone()), Action::Rotate(vec![inside.clone()], 1),
-            Action::Transfer(vec![inside.clone()], t.clone(), true)] {
+            Action::Paste(p.clone()),
+            Action::NewFolder(p.clone()), Action::Rotate(vec![inside.clone()], 1)] {
             app.status.clear(); app.run(action);
             assert_eq!(app.status, "압축 파일 안에서는 할 수 없습니다"); assert!(app.dialog.is_none());
+        }
+        for action in [Action::Cut(vec![inside.clone()]), Action::Transfer(vec![inside.clone()], t.clone(), true)] {
+            app.run(action);
+            assert_eq!(app.status, "압축 파일 안의 그림은 옮길 수 없습니다. 복사만 됩니다");
+            assert!(app.dialog.is_none());
         }
         assert_eq!(std::fs::read(&p).unwrap(), before);
         let tex = app.ctx.load_texture("archive-preview", ColorImage::new([2, 3], Color32::WHITE), tex_opts());
